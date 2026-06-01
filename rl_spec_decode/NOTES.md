@@ -61,12 +61,15 @@ driver 535.261.03.
 - Acceptance NUMBER (standalone, REAL weights, via `measure_spec_accept.py`, greedy):
   **mean acceptance length 2.736 / 3.0, per-draft-token acceptance 86.8%**
   (num_drafts 749, draft_tokens 1498, accepted 1300). → the MTP drafter itself is excellent.
-- KEY INSIGHT: standalone MTP is 86.8% but the IN-VERL run got *slower* (87 vs 99 tok/s). This
-  confirms the in-loop MTP head ran on **dummy weights** (verl uses `load_format=dummy` and reshards
-  only policy weights via Path B, never the MTP head). So Exp-1 plumbing is proven, but MTP only
-  *accelerates* the rollout if the draft weights are loaded/synced — i.e. the verl-native
-  `actor_rollout_ref.model.mtp.*` path (which reshards the MTP head), not engine_kwargs. This is
-  exactly the hook the co-training phase needs.
+- HYPOTHESIS (NOT yet confirmed — being measured directly): standalone MTP is 86.8% but the IN-VERL
+  run got *slower* (87 vs 99 tok/s). This *suggests* the in-loop MTP head may run on **dummy weights**
+  (verl uses `load_format=dummy`; Path B reshards only policy weights, and whether that includes the
+  MTP head is unverified). The slowdown could equally be spec overhead at tiny scale (temp=1.0 sampling
+  vs standalone greedy, n=2 reusing the 1 MTP layer, eager). **Do NOT treat 86.8% as the in-rollout
+  number** — it's the drafter's standalone quality. The in-rollout number is being measured via the
+  read-only verl patch (see Patches below). If it's near 0% → Path B doesn't sync the draft and effective
+  in-RL MTP needs the verl-native `model.mtp.*` resync path (the co-training hook); if ~86% → the head
+  is real in-loop and the slowdown is pure overhead.
   Note: vLLM v1's offline `LLM.get_metrics()` needs `disable_log_stats=False`; the verl async-server
   path doesn't emit a spec-decode stat line to stdout, which is why the in-loop number isn't directly
   readable (standalone measurement is the clean way).
@@ -78,4 +81,10 @@ driver 535.261.03.
 - Errors / fixes needed:
 
 ## Patches applied to verl/vLLM (if any)
-- None expected (config-only). Record here if that changes.
+- Baselines (RUN 0/1/2) are **config-only** — no verl/vLLM source changes.
+- **`patches/spec_accept_measurement.patch`** (MEASUREMENT ONLY, not part of the baselines):
+  first and only verl source modification so far. Read-only hook in `vLLMHttpServer.sleep()`
+  that logs in-rollout spec-decode acceptance from the Prometheus registry. Does not alter
+  generation/sampling/spec-config/weight-sync. Applied with `git apply`, reverted with `git apply -R`
+  (round-trips to byte-identical original — verified). See `patches/README.md`. Used only to obtain
+  the in-rollout MTP acceptance number; reverted afterward so the baseline verl is unmodified.
