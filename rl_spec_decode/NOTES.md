@@ -24,7 +24,13 @@ driver 535.261.03.
   assert torch unchanged. ⬜ re-verify pending.
 
 ## RUN 0 — smoke (no spec)
-- Status: ⬜ pass / ✅ attempt-1 FAILED (fixed, re-run pending)
+- Status: ✅ **PASS** (attempt 4). All 3 GRPO steps completed; `update_weights ~5–6 s/step`
+  (FSDP→vLLM-0.22 resharding works each step), throughput ~94–99 tok/s, `critic/score/mean
+  0.046875`. **The verl×vLLM-0.22 rollout + weight-sync path is proven.** Env: HF_HUB_OFFLINE=1.
+- Watch item (benign): at shutdown, a DataLoader worker was SIGKILLed (CPU RAM ~203 GB across
+  16 workers); training had already finished. If a longer run trips the OOM killer mid-train,
+  drop `data.dataloader_num_workers` and/or worker count.
+- History of fixes to get here:
 - **Attempt 1:** model downloaded + instantiated fine (Qwen3.5-4B = hybrid linear/full
   attention VL model w/ native MTP, `mtp_num_hidden_layers=1`), but crashed at ref-model
   build: `ImportError: FlashAttention2 ... not installed`. Cause: verl
@@ -40,7 +46,7 @@ driver 535.261.03.
   assertion: embed_tokens (248320×2560 fp32 ≈ 2.54 GB) > default 2048 MB transfer bucket.
   **Fix:** `actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096`
   (added to all runs). This PROVES verl×vLLM-0.22 engine init + hybrid-model load work.
-- **Attempt 4 (bucket=4096):** ⬜ pending.
+- **Attempt 4 (bucket=4096 + qwen-vl-utils + HF_HUB_OFFLINE=1):** ✅ completed end-to-end.
 
 ## RUN 1 — MTP (Path B, method=mtp, n=2)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail
