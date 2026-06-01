@@ -249,8 +249,28 @@ SAME orphaned buffers DFlash has — `layers.0.self_attn.rotary_emb.cos_sin_cach
   `inject_draft -> changed=12 unchanged=1(embed) embed=copied`; `--diff` all params/buffers match (only a
   5e-4 bf16 rounding blip on cos_sin_cache norm). So real MTP weights + recomputed buffers fully recover.
 - verl patch `draft_inject_static.patch` generalized (gate `not in ("dflash","mtp")`); hunk count unchanged
-  (`@@ -205,6 +205,128 @@`), 5 gates re-verified. NEXT: RUN 1 (mtp) in real verl + measurement; expect
-  `[SPEC-ACCEPT]` ~0% → ~80–87% (mean-len ~2.6–2.74) and `[DRAFT-BUF] rope_recomputed=1 scales_reset=4`.
+  (`@@ -205,6 +205,128 @@`), 5 gates re-verified.
+
+## ✅ RUN 1 (MTP) IN-ROLLOUT — SOLVED (measured in real verl)
+Same patches, `run1_mtp.sh` (method=mtp n=2 via Path B), 3 GRPO steps, 8 replicas. RESULT:
+- **No crash**, completed 3/3 (the trailing `DataLoader worker ... Killed` is the benign shutdown OOM
+  noted in RUN 0 — cpu_mem ~200GB — AFTER training finished; all steps + final metrics done).
+- Every wake/replica: `[DRAFT-BUF] rope_recomputed=1 rope_fail=0 scales_reset=4 err=None` and
+  `[DRAFT-INJECT] model=Qwen/Qwen3.5-4B params=13 changed=12 unchanged=1(embed) embed=copied rebuilt=False`
+  (MTP head loaded from the TARGET checkpoint; no fused rebuild, correct for MTP).
+- **IN-ROLLOUT MTP acceptance: per_draft_token ≈ 87.8–88.7%, mean_acceptance_length ≈ 2.76–2.77**, steady
+  across replicas+steps. So **0.000% → ~88%/2.77**, matching/edging past the standalone greedy ref
+  (86.8%/2.74). Throughput ~114–121 tok/s (GRPO-step) vs ~87 dummy / ~94–99 no-spec → real speedup.
+
+## ✅✅ BOTH SPEC METHODS NOW EFFECTIVE IN THE RL ROLLOUT (deliverable complete)
+| method | in-rollout BEFORE | in-rollout NOW | standalone ref |
+|---|---|---|---|
+| DFlash (n=15) | 0.16% / 1.02 | **~38.5% / 6.78** | 38.5% / 6.78 |
+| MTP (n=2)     | 0.000% / 1.00 | **~88% / 2.77**   | 86.8% / 2.74 |
+One root cause (dummy draft weights + sleep-zeroed config buffers rope cos_sin_cache + attn scales),
+one fix (`draft_inject_static.patch`: `_inject_independent_draft_weights` + `_recompute_draft_buffers`,
+gated `{dflash,mtp}`), proven standalone (modes A/E) then in real verl. Drafter runs on real, re-synced
+weights every wake on all 8 colocated replicas. STATIC source for now → co-training is the next phase.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
