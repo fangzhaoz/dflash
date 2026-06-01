@@ -1,0 +1,30 @@
+# Resolved versions — n125-010-058  2026-06-01T00:26:38Z
+conda_env: dflash-verl
+verl_ref_requested: v0.7.1
+verl_commit: bec9ef74768dd201881cd4e54cd0385e87caae27
+vllm_install_cmd: uv pip install -U --pre vllm --torch-backend=cu128 --extra-index-url https://wheels.vllm.ai/nightly/cu128
+
+vllm: 0.22.0
+torch: 2.11.0+cu128
+transformers: 5.9.0
+tensordict: 0.10.0
+ray: 2.55.1
+numpy: 2.3.5
+flash-attn: NOT-INSTALLED (PackageNotFoundError)
+flashinfer-python: 0.6.11.post2
+datasets: 4.8.5
+huggingface-hub: 1.17.0
+accelerate: 1.13.0
+peft: 0.19.1
+xformers: NOT-INSTALLED (PackageNotFoundError)
+triton: 3.6.0
+torch.cuda: 12.8 | torch.cuda.is_available: True
+gpu_count: 8
+gpu0: NVIDIA H100 80GB HBM3
+
+# nvidia-smi
+NVIDIA H100 80GB HBM3, 81559 MiB, 535.261.03 (x8)
+
+# ENV GATE: PASSED
+#   cuda_available=True
+#   dflash_refs_in_build=11  (incl. v1/spec_decode/dflash.py — the DFlash proposer)
