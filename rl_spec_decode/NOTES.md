@@ -49,10 +49,20 @@ driver 535.261.03.
 - **Attempt 4 (bucket=4096 + qwen-vl-utils + HF_HUB_OFFLINE=1):** ✅ completed end-to-end.
 
 ## RUN 1 — MTP (Path B, method=mtp, n=2)
-- Status: ⬜ not run / ⬜ pass / ⬜ fail
-- INTEGRATION (startup speculative_config shows method=mtp):
-- BEHAVIOR (accepted tokens / acceptance rate):
-- Errors / fixes needed:
+- Status: ✅ **PASS** (Exp 1 criteria met). 3 steps completed; `update_weights ~5.7–6.4 s/step`
+  (resharding works with spec on).
+- INTEGRATION ✅: serve args contain `--speculative_config '{"method": "mtp",
+  "num_speculative_tokens": 2}'`; config echo shows `engine_kwargs.vllm.speculative_config`.
+  → the Path B `+...engine_kwargs.vllm.speculative_config.*` Hydra override works, verl forwards it.
+- BEHAVIOR ✅ (engaged, not silent AR): spec-decode-only Triton kernels JIT-compiled & run
+  during inference — `rejection_greedy_sample_kernel` (verify/accept), `eagle_prepare_inputs_padded_kernel`
+  (MTP draft prep) — plus `vllm speculative.py:709` num_spec_tokens warning. Throughput 87 vs
+  RUN0 99 tok/s (spec overhead at tiny scale).
+- Acceptance NUMBER: not surfaced — vLLM v1 logs no SpecDecoding/acceptance line to stdout in
+  this verl async-server path (grep empty even with disable_log_stats=False). For a hard number
+  we'd enable Prometheus or run a standalone `vllm serve` + `dflash.benchmark`. Doesn't block the
+  criterion (engagement proven by kernels). Open: whether the MTP head has real vs dummy weights
+  (load_format=dummy) — distinguishable only via the acceptance number.
 
 ## RUN 2 — DFlash (Path B, method=dflash, z-lab/Qwen3.5-4B-DFlash, n=15)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail
