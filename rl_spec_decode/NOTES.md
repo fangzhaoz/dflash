@@ -32,7 +32,15 @@ driver 535.261.03.
   never installed flash-attn. **Fix (config-only):** `+actor_rollout_ref.model.override_config.attn_implementation=sdpa`
   (new `ATTN_IMPL` env var, default sdpa; fallback eager). Engine not yet reached, so
   verl×vLLM-0.22 still unproven.
-- **Attempt 2 (sdpa):** ⬜ pending.
+- **Attempt 2 (sdpa):** got past model build, then `import vllm._C: libcudart.so.13`
+  (cu13 vLLM wheel — see env log; fixed with cu129 wheel).
+- **Attempt 3 (cu129 vLLM):** MAJOR progress — vLLM 0.22 engine fully initialized on the
+  hybrid Qwen3.5 model (Mamba/GDN linear attn, FlashInfer GDN prefill JIT, API router up),
+  training started, reached the **FSDP→vLLM weight-resharding** path. Failed there on a config
+  assertion: embed_tokens (248320×2560 fp32 ≈ 2.54 GB) > default 2048 MB transfer bucket.
+  **Fix:** `actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096`
+  (added to all runs). This PROVES verl×vLLM-0.22 engine init + hybrid-model load work.
+- **Attempt 4 (bucket=4096):** ⬜ pending.
 
 ## RUN 1 — MTP (Path B, method=mtp, n=2)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail

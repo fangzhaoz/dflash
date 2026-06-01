@@ -82,6 +82,7 @@ COMMON=(
     actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.enable_chunked_prefill=False
     actor_rollout_ref.rollout.free_cache_engine=True
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
     actor_rollout_ref.rollout.disable_log_stats=False
     actor_rollout_ref.rollout.n=4
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
