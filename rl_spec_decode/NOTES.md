@@ -95,6 +95,17 @@ driver 535.261.03.
   and verl reshards only the policy, never the draft. So my earlier hypothesis (separate draft
   repo dodges dummy) is WRONG — measured.
 
+## Route 1 experiment — `rollout.load_format=auto` (MTP): NEGATIVE
+Ran `run1_mtp.sh actor_rollout_ref.rollout.load_format=auto` with the measurement patch.
+**In-rollout acceptance stayed 0.000%** (accepted=0, throughput ~81–88 tok/s, no acceleration).
+So `load_format=auto` alone does NOT give the draft real, usable weights in the verl rollout —
+route 1 is INSUFFICIENT (not written up as working; the measured number did not move).
+Pending 1-line diagnostic (`grep load_format` in the log) to tell which sub-case:
+(a) override reached engine but the per-step policy reshard overwrote the MTP head → need
+the resync path to handle the draft explicitly; (b) verl forced dummy → override ignored.
+Either way, making the draft effective in verl training is real engineering (the co-training
+phase), not a config flip.
+
 ## KEY UNIFIED FINDING (both baselines)
 In the verl GRPO rollout with Path B, **every** speculative draft (MTP head AND DFlash) runs on
 **dummy weights** because verl sets `load_format=dummy` and reshards only the policy → in-rollout
