@@ -215,8 +215,24 @@ NEVER scans attrs → never touches kv_cache → no crash by construction (only 
   rope_recomputed=5 rope_fail=0 scales_reset=20 err=None`, acceptance **0% → greedy 0.385/6.78,
   temp1.0 0.292/5.37 (== auto-init A)**, `--diff A vs E` all buffers+params match. This exact logic is the
   verl patch (`draft_inject_static.patch`, hunk `@@ -205,6 +205,128 @@`, mechanically gate-verified).
-- NEXT: run it in real verl (RUN 2 + measurement patch); success = `[SPEC-ACCEPT per-step]` on steps 2–3
-  moving from ~0.0016 toward ~0.39, and `[DRAFT-BUF] rope_recomputed=5 rope_fail=0`.
+## ✅ RUN 2 (DFlash) IN-ROLLOUT — SOLVED (the deliverable, MEASURED in real verl)
+Applied `draft_inject_static.patch` (recompute) + `spec_accept_measurement.patch`, ran `run2_dflash.sh`
+(3 GRPO steps, 8 colocated replicas). RESULT:
+- **No crash** — the CUDA illegal-access is gone; run completed all 3 steps (`Training Progress: 3/3`).
+- Every wake, every replica: `[DRAFT-BUF] rope_recomputed=5 rope_fail=0 scales_reset=20 err=None` and
+  `[DRAFT-INJECT] params=44 changed=43 unchanged=1 embed=copied rebuilt=True`.
+- **IN-ROLLOUT DFlash acceptance: per_draft_token ≈ 38.3–40.1%, mean_acceptance_length ≈ 6.75–7.01**,
+  steady across all replicas + steps 1→3 (e.g. replica0 step1 38.80%/6.82, step2 38.54%/6.78, step3
+  38.32%/6.75; replica6 ~39–40%/~6.9–7.0).
+- **The headline: 0.16% → ~38.5% / mean-len ~6.78 in the live verl GRPO rollout** — matches the
+  standalone real-weight reference (38.5%/6.78) essentially exactly. The DFlash drafter now runs on
+  REAL, re-synced weights every wake, on all 8 replicas. verl reverted byte-clean afterward.
+- This closes the core problem (every spec draft ran on dummy weights → 0%). FIRST DELIVERABLE DONE:
+  inject real draft weights into the live engine on every wake so spec-decode is effective in RL rollout.
+- NEXT PHASE (co-training): make the injected weights NOT static — feed a DFlash block-diffusion loss on
+  rollout responses (detached/scaled, analogous to verl's MTP CE in mtp_patch.py) so the drafter tracks
+  the moving AR policy. The injection hook is the natural place to swap the static checkpoint for the
+  co-trained drafter as the weight source.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
