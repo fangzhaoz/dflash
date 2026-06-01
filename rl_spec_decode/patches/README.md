@@ -14,6 +14,21 @@ only reads counters and logs. Requires `rollout.disable_log_stats=False` (all ru
 
 Purpose: get the **in-rollout** MTP/DFlash acceptance number directly, instead of inferring it.
 
+## draft_inject_static.patch  (FIRST verl BEHAVIOR change — write-hook, MEASUREMENT/EXPERIMENT)
+
+Adds `_inject_independent_draft_weights()` to `vLLMColocateWorkerExtension`
+(`verl/workers/rollout/vllm_rollout/utils.py`), called at the end of `update_weights_from_ipc`
+(the per-wake policy-restore path). For `method=="dflash"` only, it re-loads the **real** DFlash
+draft weights from the draft's own checkpoint (`load_format=auto`, bypassing the engine's `dummy`)
+into the live `model_runner.drafter.model` on every wake, then rebuilds the fused KV buffers
+(`_build_fused_kv_buffers`). This counters the sleep(level=2)/wake cycle that discards engine
+weights and restores only the policy. STATIC/frozen weights for now (co-training swaps the source).
+
+Self-verifying: prints `[DRAFT-INJECT] loaded N draft params ... buffers_rebuilt=...` (N=0 ⇒ silent
+no-op / name mismatch) and any exception. **Success criterion = the MEASURED acceptance number**
+(via spec_accept_measurement.patch) moving 0% → toward the ~6.88 standalone DFlash reference. "Run
+completes" is NOT success. Apply this TOGETHER with spec_accept_measurement.patch.
+
 Apply / run / revert (adjust paths to your boxes — verl at $VERL_DIR, this repo at $DFLASH_DIR):
 ```bash
 VERL_DIR=${VERL_DIR:-$HOME/verl}
