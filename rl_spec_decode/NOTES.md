@@ -18,10 +18,15 @@ driver 535.261.03.
   `v1/spec_decode/dflash.py`. Env is good for both baselines.
 
 ## RUN 0 — smoke (no spec)
-- Status: ⬜ not run / ⬜ pass / ⬜ fail
-- Completed N steps cleanly?
-- Errors / fixes needed:
-- Last ~40 lines of log:
+- Status: ⬜ pass / ✅ attempt-1 FAILED (fixed, re-run pending)
+- **Attempt 1:** model downloaded + instantiated fine (Qwen3.5-4B = hybrid linear/full
+  attention VL model w/ native MTP, `mtp_num_hidden_layers=1`), but crashed at ref-model
+  build: `ImportError: FlashAttention2 ... not installed`. Cause: verl
+  `fsdp_workers.py:394` defaults actor/ref `attn_implementation=flash_attention_2`; we
+  never installed flash-attn. **Fix (config-only):** `+actor_rollout_ref.model.override_config.attn_implementation=sdpa`
+  (new `ATTN_IMPL` env var, default sdpa; fallback eager). Engine not yet reached, so
+  verl×vLLM-0.22 still unproven.
+- **Attempt 2 (sdpa):** ⬜ pending.
 
 ## RUN 1 — MTP (Path B, method=mtp, n=2)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail

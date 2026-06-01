@@ -19,6 +19,7 @@ TRAIN_FILE=${TRAIN_FILE:-$DATA_DIR/train.parquet}
 TEST_FILE=${TEST_FILE:-$DATA_DIR/test.parquet}
 NGPUS=${NGPUS:-8}
 STEPS=${STEPS:-3}
+ATTN_IMPL=${ATTN_IMPL:-sdpa}   # HF actor/ref attn; sdpa avoids needing flash-attn. Fallback: eager.
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
@@ -58,6 +59,7 @@ COMMON=(
     data.truncation=error
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.trust_remote_code=True
+    +actor_rollout_ref.model.override_config.attn_implementation=$ATTN_IMPL
     actor_rollout_ref.model.use_remove_padding=False
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.actor.optim.lr=1e-6
