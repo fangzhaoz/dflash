@@ -24,6 +24,21 @@ into the live `model_runner.drafter.model` on every wake, then rebuilds the fuse
 (`_build_fused_kv_buffers`). This counters the sleep(level=2)/wake cycle that discards engine
 weights and restores only the policy. STATIC/frozen weights for now (co-training swaps the source).
 
+**Buffer fix (`_sync_draft_buffers`, the part that actually makes it work).** Re-loading params
+was necessary but NOT sufficient: `sleep(level=2)` frees ALL engine GPU memory; `wake` re-maps it
+**zeroed**; `load_weights` restores only **parameters**, so the draft's **config-derived buffers**
+stay zero — per-layer `rotary_emb.cos_sin_cache`, the DFlash core `_rope_cos_sin_cache` (a plain attr
+`_build_fused_kv_buffers` does NOT rebuild), and attn `_k/_q/_v/_prob_scale`. A zero rope cache makes
+the draft positionally blind → near-random drafts → ~0% acceptance (mean-len ≈ 1.0, the exact symptom).
+`_sync_draft_buffers` clones every nonzero, ≤256MiB buffer/plain-attr tensor of the draft to CPU the
+FIRST time it sees them (config constants, valid even under dummy weights), then copies them back into
+the wake-zeroed tensors on every wake. PROVEN standalone in `measure_spec_accept.py --mode
+sleep_wake_inject` (mode D): recovers DFlash greedy acceptance **0% → 38.5% / mean-len 6.78 (== normal
+init)**. WAKE-TIMING CAVEAT: the hook fires at wake (after sleep), so it can only capture good values if
+its first invocation precedes the engine's first sleep. If you see `[DRAFT-BUF] WARNING: nothing to
+capture (hook ran after sleep ...)`, capture is too late and a recompute path is needed instead — watch
+for that line in RUN 2.
+
 Self-verifying: prints `[DRAFT-INJECT] loaded N draft params ... buffers_rebuilt=...` (N=0 ⇒ silent
 no-op / name mismatch) and any exception. **Success criterion = the MEASURED acceptance number**
 (via spec_accept_measurement.patch) moving 0% → toward the ~6.88 standalone DFlash reference. "Run

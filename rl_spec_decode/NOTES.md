@@ -165,6 +165,32 @@ Re-loads real z-lab DFlash weights into the live drafter each wake.
   measure_spec_accept.py (load_format=dummy → same inject logic → measure) to isolate "injection logic
   sound?" (recovers to ~6.88) vs "verl sleep/wake fighting it?" (~0%). ~10s iterations.
 
+## ROOT CAUSE FOUND + FIX PROVEN (standalone A/B/C/D, the key result) ✅
+Built the standalone A/B/C/D isolation in `measure_spec_accept.py` (no verl, ~10s/iter). DECISIVE:
+- **A** (load_format=auto, normal init) = reference: greedy **0.385 / mean-len 6.78**, temp1.0 0.292 / 5.37.
+- **B** (load_format=dummy + the EXACT verl hook, NO sleep/wake) **== A byte-for-byte** — identical
+  acceptance, wiring, every param norm, every buffer. → **The injection LOGIC is sound.** The 0.16%
+  was never a weights/wiring/embedding problem (all those chases were red herrings; params always loaded).
+- **D** (load_format=dummy + `llm.sleep(level=2)` + `wake_up()` + the hook — verl's EXACT lifecycle,
+  the ONE variable B omitted) **reproduced verl's 0%**: greedy 0.0013 / mean-len 1.02. So the bug is
+  100% the **sleep/wake lifecycle**, not the injection.
+- **`--diff A vs D` named the exact cause:** `sleep(level=2)` frees ALL engine GPU memory; `wake` re-maps
+  it ZEROED; `load_weights` restores only **PARAMETERS**. The draft's **config-derived BUFFERS** are
+  left at zero: per-layer `rotary_emb.cos_sin_cache` (A=4096.2→0), DFlash core `_rope_cos_sin_cache`
+  (A=4096.2→0, a plain attr that `_build_fused_kv_buffers()` does NOT rebuild), and attn
+  `_k/_q/_v/_prob_scale` (A=1.0→0). Zero rope cache ⇒ draft is positionally blind ⇒ near-random drafts
+  ⇒ ~0% acceptance and mean-len ≈ 1.0 (exactly the verl symptom).
+- **FIX (model-agnostic, PROVEN): capture-before-sleep / restore-after-wake.** These buffers are
+  config-derived CONSTANTS (computed at init, identical under dummy vs real weights, unchanged across
+  steps), so we clone the nonzero ones to CPU (≤256MiB cap to skip big weight-like tensors / avoid GPU
+  OOM) before the first sleep and copy them back into the wake-zeroed tensors after each wake. With this,
+  **D fully recovers to A** (greedy 0.385 / 6.78; all buffers + params match). Diagnosis + fix confirmed.
+  Implemented as `capture_buffers`/`restore_buffers` in `measure_spec_accept.py` (mode `sleep_wake_inject`).
+- IMPLICATION for verl: the existing `draft_inject_static.patch` (params + embed + fused) is necessary
+  but INSUFFICIENT — it must ALSO restore the wake-zeroed config buffers. Porting capture/restore into
+  the verl worker-extension hook now (the one open wrinkle: verl's hook fires at wake = after sleep, so
+  capture must grab the good values at the first wake that precedes any sleep, else fall back to recompute).
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:

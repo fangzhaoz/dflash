@@ -1,9 +1,9 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -205,6 +205,77 @@
+@@ -205,6 +205,137 @@
              model_config = self.model_runner.vllm_config.model_config
              process_weights_after_loading(model, model_config, self.device)
- 
+
 +        # verl patch (WRITE-hook): re-load the independent (DFlash) draft's real weights each
 +        # wake, since sleep(level=2) discards them and verl restores only the policy.
 +        self._inject_independent_draft_weights()
@@ -67,6 +67,10 @@
 +            if inner is not None and hasattr(inner, "_build_fused_kv_buffers"):
 +                inner._build_fused_kv_buffers()
 +                rebuilt = True
++            # THE FIX: restore the config-derived buffers that sleep(level=2) zeroed and load_weights
++            # does NOT repopulate (rope caches + attn scales). Without this, the draft is positionally
++            # blind -> ~0% acceptance (the verl symptom). Proven in measure_spec_accept.py mode D.
++            self._sync_draft_buffers(draft_model)
 +            print(f"[DRAFT-INJECT] model={getattr(draft_cfg, 'model', '?')} params={len(before)} "
 +                  f"changed={len(changed)} unchanged={len(unchanged)} embed={embed_status} "
 +                  f"rebuilt={rebuilt}", flush=True)
@@ -74,6 +78,62 @@
 +        except Exception as e:
 +            import traceback
 +            print(f"[DRAFT-INJECT] FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
++
++    def _sync_draft_buffers(self, draft_model):
++        """Restore config-derived draft buffers that sleep(level=2) zeroes and load_weights does
++        NOT repopulate (rope cos_sin_cache, DFlash _rope_cos_sin_cache, attn _k/_q/_v/_prob_scale).
++        Constants computed at init (valid even under dummy); clone them the first time we see them
++        nonzero (CPU, <=256MiB each), copy them back into the zeroed tensors on every wake. Proven
++        in rl_spec_decode/measure_spec_accept.py --mode sleep_wake_inject (0% -> 38.5%/6.78, ==init)."""
++        import torch
++        CAP = 256 * 1024 * 1024
++
++        def state_tensors(root):
++            for mod_name, mod in root.named_modules():
++                for bname, b in list(mod._buffers.items()):
++                    if isinstance(b, torch.Tensor):
++                        yield (mod_name + ".#buf#." + bname, mod, bname, True)
++                for aname, a in list(vars(mod).items()):
++                    if isinstance(a, torch.Tensor) and aname not in mod._buffers:
++                        yield (mod_name + ".#attr#." + aname, mod, aname, False)
++
++        def get_t(owner, attr, is_buf):
++            return owner._buffers[attr] if is_buf else getattr(owner, attr, None)
++
++        def is_zero(t):
++            try:
++                return float(t.detach().float().norm()) == 0.0
++            except Exception:
++                return False
++
++        try:
++            cache = getattr(self, "_draft_buf_cache", None)
++            if cache is None:
++                cache = {}
++                for key, owner, attr, is_buf in state_tensors(draft_model):
++                    t = get_t(owner, attr, is_buf)
++                    if isinstance(t, torch.Tensor) and not is_zero(t) and t.numel() * t.element_size() <= CAP:
++                        cache[key] = t.detach().to("cpu", copy=True)
++                if cache:
++                    self._draft_buf_cache = cache
++                    print(f"[DRAFT-BUF] captured {len(cache)} config-derived buffers (pre-sleep)", flush=True)
++                else:
++                    print("[DRAFT-BUF] WARNING: nothing to capture (hook ran after sleep zeroed "
++                          "buffers); cannot restore by capture -> recompute path needed", flush=True)
++                    return
++            restored = 0
++            for key, owner, attr, is_buf in state_tensors(draft_model):
++                s = cache.get(key)
++                if s is None:
++                    continue
++                t = get_t(owner, attr, is_buf)
++                if isinstance(t, torch.Tensor) and tuple(t.shape) == tuple(s.shape) and is_zero(t):
++                    t.data.copy_(s.to(t.device, t.dtype))
++                    restored += 1
++            print(f"[DRAFT-BUF] restored {restored} wake-zeroed buffers into the live draft", flush=True)
++        except Exception as e:
++            import traceback
++            print(f"[DRAFT-BUF] FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
 +
      def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
          if peft_config and base_sync_done:
