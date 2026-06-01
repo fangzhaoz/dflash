@@ -154,8 +154,16 @@ Re-loads real z-lab DFlash weights into the live drafter each wake.
   heuristic does `torch.equal(target_embed, draft_embed)` — under verl's `load_format=dummy` both are
   *different dummy tensors*, so it fails → draft keeps a SEPARATE dummy embedding → every drafted
   token is garbage → ~0%. (This is the dummy-init breaking the share, specific to the verl path.)
-- Attempt 3 (fix): hook now also COPIES the real (resharded) target `get_input_embeddings()` into the
-  draft `embed_tokens` each wake (shape-guarded), bypassing the broken heuristic. ⬜ verify number.
+- Attempt 3 (embed via get_input_embeddings): `embed=shape_mismatch tgt=None` — get_input_embeddings()
+  returns None on the Qwen3_5 VL target; copy no-oped; still ~0.17%.
+- Attempt 4 (embed by name+shape): `embed=copied`, `changed=43 unchanged=1` — but acceptance STILL
+  ~0.16% (mean len 1.024). So embed was NOT the bottleneck (and the `unchanged` embed was likely
+  already real via vLLM `_maybe_share_embeddings`; the copy was redundant). MECHANISM works (43
+  diffusion params + embed loaded real each wake, self-verified), but loaded weights still don't yield
+  drafts → deeper issue (stale fused buffers across sleep/wake, draft KV-context, or a clobber).
+- NEXT: stop iterating against 3-min verl runs. Reproduce the injection STANDALONE in
+  measure_spec_accept.py (load_format=dummy → same inject logic → measure) to isolate "injection logic
+  sound?" (recovers to ~6.88) vs "verl sleep/wake fighting it?" (~0%). ~10s iterations.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
