@@ -276,6 +276,44 @@ class DFlashReproExtension:
         return {"status": "ok", "rope_recomputed": rope_done, "rope_fail": rope_fail,
                 "scales_reset": scale_done, "err": last_err}
 
+    def introspect_draft(self):
+        """Structural dump of the draft (class, param/buffer NAMES, navigation probe) so we can
+        generalize inject/recompute to a new method (e.g. mtp) from FACTS, not guesses."""
+        out = {}
+        spec = self.model_runner.vllm_config.speculative_config
+        out["method"] = getattr(spec, "method", None)
+        out["num_spec_tokens"] = getattr(spec, "num_speculative_tokens", None)
+        dcfg = getattr(spec, "draft_model_config", None)
+        out["draft_cfg_model"] = getattr(dcfg, "model", None) if dcfg is not None else None
+        dm = self._draft_model()
+        if dm is None:
+            out["draft"] = None
+            return out
+        out["draft_class"] = type(dm).__name__
+        inner = getattr(dm, "model", None)
+        out["inner_class"] = type(inner).__name__ if inner is not None else None
+        out["param_names"] = [(n, list(p.shape)) for n, p in dm.named_parameters()]
+        out["buffer_names"] = [(n, list(b.shape), str(b.dtype)) for n, b in dm.named_buffers()]
+        layers = getattr(inner, "layers", None) if inner is not None else None
+        out["inner_has_layers"] = layers is not None
+        out["num_layers"] = len(layers) if layers is not None else None
+        if layers:
+            l0 = layers[0]
+            sa = getattr(l0, "self_attn", None)
+            out["layer0_self_attn_class"] = type(sa).__name__ if sa is not None else None
+            rot = getattr(sa, "rotary_emb", None) if sa is not None else None
+            out["layer0_rotary_class"] = type(rot).__name__ if rot is not None else None
+            out["layer0_has_cos_sin_cache"] = hasattr(rot, "cos_sin_cache") if rot is not None else None
+            out["layer0_has_compute_cos_sin"] = hasattr(rot, "_compute_cos_sin_cache") if rot is not None else None
+            attn = getattr(sa, "attn", None) if sa is not None else None
+            out["layer0_attn_class"] = type(attn).__name__ if attn is not None else None
+            out["layer0_scales_present"] = ({s: hasattr(attn, s) for s in
+                ("_k_scale", "_q_scale", "_v_scale", "_prob_scale")} if attn is not None else None)
+        out["inner_has_embed_tokens"] = hasattr(inner, "embed_tokens") if inner is not None else None
+        out["draft_has_lm_head"] = hasattr(dm, "lm_head")
+        out["has_build_fused_kv"] = hasattr(inner, "_build_fused_kv_buffers") if inner is not None else None
+        return out
+
     def snapshot_draft(self):
         """Object-level snapshot of the draft (WIRING + values). data_ptr only used WITHIN this
         process to compute sharing/tie booleans (ptrs are not comparable across processes)."""
@@ -503,7 +541,7 @@ def _diff(a_path, b_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["measure", "auto", "dummy_inject", "sleep_wake_inject",
-                                        "sleep_wake_recompute"], default="measure")
+                                        "sleep_wake_recompute", "introspect"], default="measure")
     ap.add_argument("--cycles", type=int, default=1, help="sleep/wake cycles before inject")
     ap.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"), default=None)
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
@@ -519,6 +557,14 @@ def main():
 
     if args.diff:
         _diff(args.diff[0], args.diff[1])
+        return
+    if args.mode == "introspect":
+        llm = _build_llm(args, load_format="auto", worker_ext=True)
+        info = llm.collective_rpc("introspect_draft")
+        info = info[0] if isinstance(info, list) else info
+        print("\n================ DRAFT INTROSPECTION ================", flush=True)
+        print(json.dumps(info, indent=2), flush=True)
+        print("====================================================", flush=True)
         return
     if args.mode == "auto":
         _run_path(args, load_format="auto", do_inject=False)
