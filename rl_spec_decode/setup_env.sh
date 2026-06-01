@@ -32,12 +32,22 @@ VERL_REF=${VERL_REF:-v0.7.1}                       # pinned verl release
 VERL_DIR=${VERL_DIR:-$HOME/verl}                   # where verl gets cloned
 DFLASH_DIR=${DFLASH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}  # this repo
 
-# vLLM install (LAST). We pin the CUDA-12 nightly variant so it runs on this driver.
-#   VLLM_CUDA: which CUDA wheel variant to pull. cu128 is the lowest 12.x vLLM ships
-#     (cu129 default, cu130 also exist). Driver 535/12.4 runs cu128 via minor-version compat.
-#   VLLM_INSTALL_CMD: leave EMPTY to use the default uv command below; set it to fully
-#     override the install step (e.g. to try cu129, or a specific dev wheel).
-VLLM_CUDA=${VLLM_CUDA:-cu128}
+# vLLM install (LAST). Install the EXPLICIT CUDA-12 release wheel (deterministic), so the
+# compiled vllm._C links libcudart.so.12 and runs on this 535/CUDA-12.4 driver via CUDA
+# minor-version compat. Index resolution is NOT reliable here: it pulled vLLM's cu13 default
+# wheel, whose _C needs libcudart.so.13 (which a CUDA-12 driver cannot provide).
+#   v0.22.0 publishes +cu129 and +cpu wheels (NO +cu128). cu129 = CUDA 12.9, fine on this driver.
+VLLM_VERSION=${VLLM_VERSION:-0.22.0}
+VLLM_CUDA=${VLLM_CUDA:-cu129}          # vLLM WHEEL's CUDA build (its _C links libcudart.so.12)
+VLLM_WHEEL=${VLLM_WHEEL:-https://github.com/vllm-project/vllm/releases/download/v$VLLM_VERSION/vllm-$VLLM_VERSION+$VLLM_CUDA-cp38-abi3-manylinux_2_28_x86_64.whl}
+# Torch is pinned INDEPENDENTLY to the validated cu128 build, with its index also pinned to
+# cu128, so installing the cu129 vLLM wheel CANNOT drag torch to a different version OR CUDA
+# variant. (vLLM 0.22.0 declares torch==2.11.0 with no +cuXXX, so the cu128 build satisfies it;
+# vllm._C needs libcudart.so.12, which torch cu128 provides.) The gate asserts torch is unchanged.
+TORCH_PIN=${TORCH_PIN:-torch==2.11.0}
+TORCH_CUDA=${TORCH_CUDA:-cu128}
+EXPECTED_TORCH=${EXPECTED_TORCH:-2.11.0+$TORCH_CUDA}
+VLLM_PYTORCH_INDEX=${VLLM_PYTORCH_INDEX:-https://download.pytorch.org/whl/$TORCH_CUDA}
 VLLM_INSTALL_CMD=${VLLM_INSTALL_CMD:-}
 
 OUT=${OUT:-$DFLASH_DIR/rl_spec_decode/resolved_versions.txt}
@@ -47,7 +57,7 @@ echo "============================================================"
 echo " env=$ENV_NAME  python=$PYVER  verl=$VERL_REF"
 echo " VERL_DIR=$VERL_DIR"
 echo " DFLASH_DIR=$DFLASH_DIR"
-echo " vLLM install: ${VLLM_INSTALL_CMD:-uv ... vllm --torch-backend=$VLLM_CUDA (nightly/$VLLM_CUDA)}"
+echo " vLLM install: ${VLLM_INSTALL_CMD:-$VLLM_WHEEL  (+ torch $TORCH_PIN @ $TORCH_CUDA)}"
 echo " FRESH=${FRESH:-0}"
 echo "============================================================"
 
@@ -82,15 +92,17 @@ pip install --no-deps -e "$VERL_DIR"
 pip install --no-deps -e "$DFLASH_DIR"
 pip install rich loguru
 
-# 4) vLLM NIGHTLY (cu12 variant) — LAST. Explicit cu128 backend so torch can't come
-#    back as cu13. uv targets THIS conda env via --python "$CONDA_PREFIX/bin/python".
+# 4) vLLM — LAST. Explicit CUDA-12 release wheel, with torch pinned to the validated cu128
+#    build (torch==2.11.0 + cu128 index) so the wheel can't swap torch's version OR CUDA
+#    variant. Deterministic: no index ambiguity (which previously yielded a cu13 vllm whose
+#    _C needed libcudart.so.13).
 pip install -U uv
 if [ -n "$VLLM_INSTALL_CMD" ]; then
     eval "$VLLM_INSTALL_CMD"
 else
-    uv pip install --python "$CONDA_PREFIX/bin/python" -U --pre vllm \
-        --torch-backend="$VLLM_CUDA" \
-        --extra-index-url "https://wheels.vllm.ai/nightly/$VLLM_CUDA"
+    uv pip install --python "$CONDA_PREFIX/bin/python" --reinstall-package vllm \
+        "$VLLM_WHEEL" "$TORCH_PIN" \
+        --extra-index-url "$VLLM_PYTORCH_INDEX"
 fi
 # =======================================================================
 
@@ -101,19 +113,27 @@ pip check || true
 echo
 echo "############ ENV GATE: CUDA usable + dflash present (FATAL on fail) ############"
 # In an `if` so `set -e` doesn't abort before we can print the FAILED banner.
-if python - <<'PY'
+if EXPECTED_TORCH="$EXPECTED_TORCH" python - <<'PY'
 import os, sys
 ok = True
 
 import torch
+expected = os.environ.get("EXPECTED_TORCH", "")
 print(f"torch={torch.__version__}  torch.version.cuda={torch.version.cuda}  "
-      f"cuda_available={torch.cuda.is_available()}")
+      f"cuda_available={torch.cuda.is_available()}  expected={expected}")
 if not torch.cuda.is_available():
     print("FATAL: torch.cuda.is_available() is False -> CUDA build still mismatched to the driver.")
-    print("       (Want a cu12 build; check VLLM_CUDA and the driver's CUDA level.)")
+    ok = False
+if expected and torch.__version__ != expected:
+    print(f"FATAL: torch is {torch.__version__}, expected {expected} -> the vLLM install swapped torch.")
+    print("       (We pin torch to the validated cu128 build; a swap can reintroduce a driver mismatch.)")
     ok = False
 
+# Force the COMPILED extension + platform init to load (lazy `import vllm` would NOT catch a
+# CUDA-build mismatch like the libcudart.so.13 error; `from vllm import LLM` does).
 import vllm
+from vllm import LLM  # noqa: F401
+print(f"vllm import LLM: OK")
 vdir = os.path.dirname(vllm.__file__)
 hits = []
 for root, _, files in os.walk(vdir):
@@ -148,7 +168,7 @@ fi
   echo "conda_env: $ENV_NAME"
   echo "verl_ref_requested: $VERL_REF"
   echo "verl_commit: $(git -C "$VERL_DIR" rev-parse HEAD)"
-  echo "vllm_install_cmd: ${VLLM_INSTALL_CMD:-uv pip install -U --pre vllm --torch-backend=$VLLM_CUDA --extra-index-url https://wheels.vllm.ai/nightly/$VLLM_CUDA}"
+  echo "vllm_install_cmd: ${VLLM_INSTALL_CMD:-uv pip install --reinstall-package vllm $VLLM_WHEEL $TORCH_PIN --extra-index-url $VLLM_PYTORCH_INDEX}"
   echo
   python - <<'PY'
 import importlib, importlib.metadata as md

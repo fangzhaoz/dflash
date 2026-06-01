@@ -13,9 +13,15 @@ driver 535.261.03.
 - **Attempt 1 (cu13, FAILED gate):** plain-pip nightly pulled torch 2.11.0+**cu13**;
   box driver 535.261.03 = CUDA 12.4 → `torch.cuda.is_available()=False` (CUDA-13 needs
   driver ≥580).
-- **Attempt 2 (cu128, PASSED gate):** `FRESH=1 VLLM_CUDA=cu128`. `cuda_available=True`
-  on the 535 driver (CUDA minor-version compat works); `dflash_refs_in_build=11` incl.
-  `v1/spec_decode/dflash.py`. Env is good for both baselines.
+- **Attempt 2 (PASSED weak gate, but vLLM was cu13):** `cuda_available=True`, dflash present,
+  torch cu128 — but the gate used lazy `import vllm`, which never loads the compiled `_C`. The
+  vLLM WHEEL was actually the cu13 default (index resolution ignored `--extra-index-url cu128`).
+  RUN 0 then died at rollout init: `import vllm._C -> libcudart.so.13` (cu13 vLLM on a CUDA-12
+  driver/torch).
+- **Attempt 3 (explicit cu129 wheel):** install `vllm-0.22.0+cu129-...whl` (v0.22.0 has NO
+  +cu128; cu129 links libcudart.so.12 → runs on 535 driver). torch pinned 2.11.0+cu128 (cu128
+  index) so the wheel can't swap it. **Gate hardened:** `from vllm import LLM` (forces `_C`) +
+  assert torch unchanged. ⬜ re-verify pending.
 
 ## RUN 0 — smoke (no spec)
 - Status: ⬜ pass / ✅ attempt-1 FAILED (fixed, re-run pending)
