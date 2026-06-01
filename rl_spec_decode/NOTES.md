@@ -79,10 +79,31 @@ driver 535.261.03.
   readable (standalone measurement is the clean way).
 
 ## RUN 2 — DFlash (Path B, method=dflash, z-lab/Qwen3.5-4B-DFlash, n=15)
-- Status: ⬜ not run / ⬜ pass / ⬜ fail
-- INTEGRATION (startup speculative_config shows method=dflash + draft):
-- BEHAVIOR (accepted tokens / acceptance rate / throughput):
-- Errors / fixes needed:
+- Status: ✅ **PASS** (Exp 2 criteria met). 3 steps; `update_weights ~5.4 s/step`.
+- Fix needed first: `num_speculative_tokens=15` × default `max_num_seqs=1024` made vLLM reserve
+  ~14k draft slots > `max_num_batched_tokens=8192` → `VllmConfig` ValidationError
+  (`max_num_scheduled_tokens=-6144`) at engine init. Fixed by `max_num_batched_tokens=32768`
+  (DFlash README value) + `max_num_seqs=64` (our real concurrency) in COMMON.
+- INTEGRATION ✅: serve args show `--speculative_config '{"method":"dflash","model":
+  "z-lab/Qwen3.5-4B-DFlash","num_speculative_tokens":15}'`; draft downloaded; dflash kernels
+  (`copy_and_expand_dflash_inputs_kernel`) ran. Path B passthrough works for DFlash.
+- BEHAVIOR: drafting engaged (drafts ~90k, draft_tokens ~1.45M) but **in-rollout acceptance =
+  0.000%** (measured via the patch; accepted=0, mean acceptance length 1.000).
+- SMOKING GUN: `WARNING qwen3_dflash.py:363 DFlash buffer initialization was skipped. If dummy
+  weights are not in use, this may indicate an error in weight loading.` → vLLM loaded the DFlash
+  draft with **dummy weights**. verl's `load_format=dummy` is GLOBAL (applies to the draft too),
+  and verl reshards only the policy, never the draft. So my earlier hypothesis (separate draft
+  repo dodges dummy) is WRONG — measured.
+
+## KEY UNIFIED FINDING (both baselines)
+In the verl GRPO rollout with Path B, **every** speculative draft (MTP head AND DFlash) runs on
+**dummy weights** because verl sets `load_format=dummy` and reshards only the policy → in-rollout
+acceptance is **0.0%** for both (vs 86.8% standalone for MTP with real weights). Exp-1/Exp-2
+plumbing is fully proven (config passthrough + draft machinery active in-loop), but neither
+accelerates RL yet. To make spec decoding *effective* in verl training, the draft must get real
+weights — two sub-problems for the co-training phase: (1) **load the draft real** in the rollout
+engine (e.g. `rollout.load_format=auto` so vLLM loads the draft from its checkpoint — UNVERIFIED,
+to test next), and (2) **resync** the draft as the policy updates (the novel contribution).
 
 ## Patches applied to verl/vLLM (if any)
 - Baselines (RUN 0/1/2) are **config-only** — no verl/vLLM source changes.
