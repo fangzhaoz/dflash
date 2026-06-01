@@ -1,9 +1,10 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -205,6 +205,51 @@
+@@ -204,7 +204,53 @@
+             model = self.model_runner.model
              model_config = self.model_runner.vllm_config.model_config
              process_weights_after_loading(model, model_config, self.device)
- 
++
 +        # verl patch (WRITE-hook): re-load the independent (DFlash) draft's real weights each
 +        # wake, since sleep(level=2) discards them and verl restores only the policy.
 +        self._inject_independent_draft_weights()
@@ -11,17 +12,15 @@
 +    def _inject_independent_draft_weights(self):
 +        """STATIC-REAL draft injection (verl patch, WRITE-hook; NOT part of the baselines).
 +
-+        v0.7.1's update_weights_from_ipc restores only the policy (self.model_runner.model); the
-+        sleep(level=2)/wake cycle discards engine weights each step, so an INDEPENDENT draft (DFlash)
-+        is never given real weights. Re-load its REAL weights from its OWN checkpoint into the live
-+        drafter on every wake. Frozen/static for now (co-training swaps the weight source later).
-+        Self-verifying: prints how many draft params were loaded (0 == name mismatch / silent no-op).
-+        Does NOT touch the policy, sampling, spec config, or the policy weight-sync.
++        Re-load the INDEPENDENT (DFlash) draft's REAL weights from its OWN checkpoint into the live
++        drafter on every wake (v0.7.1 restores only the policy; sleep(level=2) discards the draft).
++        Self-verifying via in-place param-NORM delta: 'changed' = params actually loaded, 'unchanged'
++        = params NOT loaded (the likely-broken ones). Does NOT touch policy/sampling/spec/sync.
 +        """
 +        try:
 +            spec = self.model_runner.vllm_config.speculative_config
 +            if spec is None or getattr(spec, "method", None) != "dflash":
-+                return  # only the independent-draft (dflash) case
++                return
 +            drafter = getattr(self.model_runner, "drafter", None)
 +            draft_model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
 +            draft_cfg = getattr(spec, "draft_model_config", None)
@@ -29,25 +28,28 @@
 +                print(f"[DRAFT-INJECT] skip: draft_model={draft_model is not None} "
 +                      f"draft_cfg={draft_cfg is not None}", flush=True)
 +                return
-+            # Load REAL weights from the draft's OWN checkpoint (default load_format=auto),
-+            # bypassing the engine's load_format=dummy, and apply to the live drafter.
 +            from vllm.config import LoadConfig
 +            from vllm.model_executor.model_loader import get_model_loader
-+
+ 
++            params = dict(draft_model.named_parameters())
++            before = {n: float(p.detach().float().norm()) for n, p in params.items()}
 +            loader = get_model_loader(LoadConfig(load_format="auto"))
-+            weights = loader.get_all_weights(draft_cfg, draft_model)
-+            loaded = draft_model.load_weights(weights)
-+            n_loaded = len(loaded) if loaded is not None else -1
-+            # Rebuild the fused KV buffers from the now-real weights (stale if built from dummy).
++            draft_model.load_weights(loader.get_all_weights(draft_cfg, draft_model))
++            changed = [n for n, p in params.items()
++                       if abs(float(p.detach().float().norm()) - before[n]) > 1e-6]
++            changed_set = set(changed)
++            unchanged = [n for n in before if n not in changed_set]
 +            inner = getattr(draft_model, "model", None)
 +            rebuilt = False
 +            if inner is not None and hasattr(inner, "_build_fused_kv_buffers"):
 +                inner._build_fused_kv_buffers()
 +                rebuilt = True
-+            print(f"[DRAFT-INJECT] loaded {n_loaded} draft params from "
-+                  f"{getattr(draft_cfg, 'model', '?')}; buffers_rebuilt={rebuilt}", flush=True)
++            print(f"[DRAFT-INJECT] model={getattr(draft_cfg, 'model', '?')} params={len(before)} "
++                  f"changed={len(changed)} unchanged={len(unchanged)} rebuilt={rebuilt}", flush=True)
++            print(f"[DRAFT-INJECT] unchanged_sample={unchanged[:8]}", flush=True)
 +        except Exception as e:
-+            print(f"[DRAFT-INJECT] FAILED: {type(e).__name__}: {e}", flush=True)
++            import traceback
++            print(f"[DRAFT-INJECT] FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
 +
      def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
          if peft_config and base_sync_done:

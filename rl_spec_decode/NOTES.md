@@ -138,6 +138,17 @@ measurement. Conclusion unchanged (per-wake draft injection required); the MiMo-
 description applies to newer verl, not the box we're on. The injection patch is built against the
 real v0.7.1 file (`draft_inject_static.patch`).
 
+## WRITE-HOOK (static-real DFlash injection) — IN PROGRESS, partial
+`draft_inject_static.patch` (first verl behavior change; built against real v0.7.1 utils.py).
+Re-loads real z-lab DFlash weights into the live drafter each wake.
+- Attempt 1: hook RAN every wake (`[DRAFT-INJECT] ... buffers_rebuilt=True`); acceptance moved
+  **0.000% → ~0.18%** (mean length 1.000 → ~1.027). Non-zero but far below the ~39%/6.9 reference →
+  weights landing partially/wrong ("ran but didn't take"). Diagnostics too weak: `load_weights`
+  returns None (so loaded-count was -1, uninformative); `qwen3_dflash.py:363` buffer warning is at
+  init dummy_run (likely benign). Hypothesis: partial load / name mismatch on the diffusion core.
+- Attempt 2 (pending): enhanced hook measures the load by in-place param-NORM delta — reports
+  `changed`/`unchanged` param counts + sample unchanged names → pinpoints what didn't load.
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:
