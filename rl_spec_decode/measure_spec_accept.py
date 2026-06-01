@@ -15,6 +15,15 @@ Three paths (run as separate processes; A and B each write a JSON snapshot, then
                             named_buffers, embed sharing (data_ptr), lm_head tie, d2t / index map,
                             fused buffers. Reveals WIRING differences a norm-delta can't see.
 
+  (D) --mode sleep_wake_inject : load_format=dummy + enable_sleep_mode, then replicate verl's
+                            per-step lifecycle exactly: init(dummy) -> llm.sleep(level=2) [DISCARDS
+                            engine weights] -> llm.wake_up() [re-allocs] -> load_main_real + inject
+                            -> measure. This is the ONE variable B omits. B already == A (injection
+                            logic is sound, proven); if D drops to ~0% the sleep/wake discard/realloc
+                            is the verl culprit (reproduced standalone @ ~10s/iter). --diff A.json D.json
+                            then names exactly what wake breaks that the post-wake inject can't restore.
+                            --cycles N repeats sleep/wake to mimic multi-step.
+
 Hypothesis under test (instrumented, not assumed): normal init runs _maybe_share_embeddings +
 weight-tying + d2t/buffer build that load_weights-from-dummy skips, so B has the right param
 VALUES but the wrong draft<->target WIRING. If B's acceptance recovers to A -> injection logic
@@ -168,18 +177,20 @@ class DFlashReproExtension:
 # ===========================================================================
 # Helpers
 # ===========================================================================
-def _build_llm(args, load_format, worker_ext):
+def _build_llm(args, load_format, worker_ext, enable_sleep=False):
     from vllm import LLM
     spec = {"method": args.method, "num_speculative_tokens": args.num_spec_tokens}
     if args.draft_model:
         spec["model"] = args.draft_model
-    print(f"[build] load_format={load_format} spec={spec}", flush=True)
+    print(f"[build] load_format={load_format} spec={spec} enable_sleep={enable_sleep}", flush=True)
     kw = dict(
         model=args.model, trust_remote_code=True, speculative_config=spec,
         enforce_eager=True, gpu_memory_utilization=args.gpu_mem_util,
         max_model_len=args.max_model_len, max_num_seqs=len(QUESTIONS),
         disable_log_stats=False, load_format=load_format,
     )
+    if enable_sleep:
+        kw["enable_sleep_mode"] = True
     if worker_ext:
         kw["worker_extension_cls"] = WORKER_EXT
     return LLM(**kw)
@@ -227,12 +238,22 @@ def _measure(llm, prompts, temperature, max_tokens, prev_totals):
     return res, tot
 
 
-def _run_path(args, load_format, do_inject):
+def _run_path(args, load_format, do_inject, sleep_wake=False):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     prompts = [tok.apply_chat_template([{"role": "user", "content": q}],
                                        tokenize=False, add_generation_prompt=True) for q in QUESTIONS]
-    llm = _build_llm(args, load_format, worker_ext=True)
+    llm = _build_llm(args, load_format, worker_ext=True, enable_sleep=sleep_wake)
+
+    if sleep_wake:
+        # Replicate verl's per-step lifecycle: the ONLY variable B-vs-verl omits.
+        # init(dummy) -> sleep(level=2) DISCARDS engine weights -> wake re-allocs ->
+        # (then the inject block below restores policy + draft, exactly verl's order).
+        print(f"[sleep_wake] llm.sleep(level=2) x{args.cycles} cycle(s) ...", flush=True)
+        for i in range(args.cycles):
+            llm.sleep(level=2)
+            llm.wake_up()
+            print(f"  cycle {i+1}/{args.cycles}: slept(2)+woke", flush=True)
 
     inject_status = None
     if do_inject:
@@ -248,9 +269,10 @@ def _run_path(args, load_format, do_inject):
     snap = llm.collective_rpc("snapshot_draft")
     snap = snap[0] if isinstance(snap, list) else snap
 
-    result = {"load_format": load_format, "inject": inject_status,
+    result = {"load_format": load_format, "inject": inject_status, "sleep_wake": sleep_wake,
               "greedy": greedy, "temp1.0": temp1, "snapshot": snap}
-    print("\n================ RESULT (" + ("dummy_inject" if do_inject else "auto") + ") ================", flush=True)
+    _label = "sleep_wake_inject" if sleep_wake else ("dummy_inject" if do_inject else "auto")
+    print("\n================ RESULT (" + _label + ") ================", flush=True)
     for lab in ("greedy", "temp1.0"):
         r = result[lab]
         print(f"  {lab}: per_draft_token_acceptance={r['per_draft_token_acceptance']}  "
@@ -316,7 +338,8 @@ def _diff(a_path, b_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["measure", "auto", "dummy_inject"], default="measure")
+    ap.add_argument("--mode", choices=["measure", "auto", "dummy_inject", "sleep_wake_inject"], default="measure")
+    ap.add_argument("--cycles", type=int, default=1, help="sleep/wake cycles before inject (sleep_wake_inject only)")
     ap.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"), default=None)
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--method", default="dflash")
@@ -336,6 +359,8 @@ def main():
         _run_path(args, load_format="auto", do_inject=False)
     elif args.mode == "dummy_inject":
         _run_path(args, load_format="dummy", do_inject=True)
+    elif args.mode == "sleep_wake_inject":
+        _run_path(args, load_format="dummy", do_inject=True, sleep_wake=True)
     else:  # legacy single measurement (real weights, given temperature)
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
