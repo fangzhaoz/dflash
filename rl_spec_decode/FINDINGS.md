@@ -1,118 +1,157 @@
-# Findings: speculative decoding passthrough in verl's vLLM rollout
+# Findings & Runbook: vLLM speculative decoding in verl's RL rollout
 
-Investigation done by reading verl source on GitHub (tag **v0.7.1**, the latest
-release, and `main`). Goal: can verl pass a `speculative-config` to its vLLM rollout
-engine, and what are the exact config keys? No remote execution was involved — this is
-a static source read, to be confirmed against the actually-installed versions.
+Baseline integration phase. Goal: prove verl's vLLM rollout can run spec decoding
+end-to-end in a tiny GRPO loop, two methods (MTP, DFlash). **Not** building the drafter
+re-sync / co-training yet — that's the next phase.
 
-## TL;DR
+Investigation = static source read of verl **v0.7.1** (latest release) + `main`. Nothing
+has been executed on the remote box yet; all version claims are to be confirmed against
+the actually-installed wheels via `resolved_versions.txt` from `setup_env.sh`.
 
-- **No verl patch is needed.** verl exposes speculative decoding to the vLLM rollout
-  engine through **two** mechanisms. We can drive both experiments from config alone.
-- **Important architecture note:** verl retired the SPMD rollout (PR #4411). As of
-  v0.7.1 the vLLM rollout is **async-server only** (`AsyncLLM.from_vllm_config`). The
-  engine is launched by composing a `vllm serve ...` CLI arg list. Our spec-config rides
-  on that CLI exactly like a standalone `vllm serve`.
-- **There is a real version blocker to resolve first** (see "Blocker" below): verl
-  v0.7.1 pins `vllm>=0.8.5,<=0.12.0`, but DFlash's vLLM `method: dflash` needs vLLM
-  v0.20.1+ (nightly). Those ranges do not overlap.
+---
 
-## Where the spec-config enters the engine
+## 1. Environment decision
 
-File: `verl/workers/rollout/vllm_rollout/vllm_async_server.py`, in `launch_server()`.
-It builds an `args` dict, converts it to a `vllm serve` CLI list via
-`build_cli_args_from_config(...)`, then calls `AsyncEngineArgs.from_cli_args(...)`.
+**One conda env** (py3.12), all heavy installs via pip, in a deliberate order so the
+vLLM nightly is never downgraded:
 
-`build_cli_args_from_config` (in `.../vllm_rollout/utils.py`) **JSON-serializes any dict
-value**, so a dict under `speculative_config` becomes a proper
-`--speculative-config '{...}'` on the engine command line.
+1. verl base deps (`requirements.txt` — has **no** vLLM pin; the pin lives only in the
+   `[vllm]` extra, which we don't use)
+2. `pip install --no-deps -e verl`  (verl package; can't re-pin/downgrade vLLM)
+3. `pip install --no-deps -e dflash`  (+ `rich loguru`)
+4. **vLLM nightly LAST**
 
-### Path A — native MTP block (first-class, used for Experiment 1)
+Why one env / why override the pin: verl v0.7.1's vLLM ceiling **`vllm>=0.8.5,<=0.12.0`
+lives ONLY in the `[vllm]` extra** — `VLLM_REQUIRES` (setup.py:52) wired via
+`extras_require={"vllm": VLLM_REQUIRES}` (setup.py:68). It is **not** in `install_requires`
+(setup.py:26–, no vllm entry) and **not** in `requirements.txt` (vllm is commented at
+:19). DFlash's vLLM `method: dflash` needs **vLLM v0.20.1+ (nightly)** (DFlash README) —
+above that ceiling. Because our install order uses `requirements.txt` (step 1) and
+`verl --no-deps` (step 2, which skips both extras and install_requires), **the `[vllm]`
+extra is never resolved, so the ceiling never applies** — no conflict to override; the
+`--no-deps` is what keeps it that way. (Verified: install order is consistent with this.)
 
-`vllm_async_server.py` (v0.7.1, ~L347):
+What requirements.txt DOES pin and we therefore apply: `numpy<2.0.0` (requirements.txt:8)
+and `tensordict>=0.8.0,<=0.10.0,!=0.9.0` (requirements.txt:16). These may fight whatever
+the nightly pulls — `pip check` in setup surfaces it.
 
-```python
-if self.config.mtp.enable and self.config.mtp.enable_rollout:
-    speculative_config = {
-        "method": self.config.mtp.method,                       # default "mtp"
-        "num_speculative_tokens": self.config.mtp.num_speculative_tokens,  # default 1
-    }
-    args["speculative_config"] = speculative_config
-```
+verl's rollout is largely version-decoupled (composes a `vllm serve` CLI list → calls
+`AsyncEngineArgs` / `AsyncLLM.from_vllm_config`) and has explicit version branches up to
+`>=0.13.0` (`vllm_async_server.py:57–63`, also :333/:692/:747). **Nothing is tested at
+0.20+ — treat nightly compatibility as UNVERIFIED; RUN 0 below is the actual gate.**
 
-`MtpConfig` (`verl/workers/config/model.py`) fields:
-`enable`, `enable_train`, `enable_rollout`, `method` (default `"mtp"`),
-`num_speculative_tokens` (default 1).
+Script: `setup_env.sh` → writes/pastes back `resolved_versions.txt` (verl commit, vLLM,
+torch, transformers, tensordict, ray, CUDA, GPUs, + `pip check` conflicts).
 
-**Exact verl config keys for Experiment 1 (MTP):**
-```
-actor_rollout_ref.rollout.mtp.enable=True
-actor_rollout_ref.rollout.mtp.enable_rollout=True
-actor_rollout_ref.rollout.mtp.method=mtp
-actor_rollout_ref.rollout.mtp.num_speculative_tokens=2
-```
-This reproduces `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`.
-Note: this block only supports `method` + `num_speculative_tokens` — fine for MTP.
+---
 
-### Path B — generic engine_kwargs passthrough (used for Experiment 2)
+## 2. How spec-config reaches the engine (two passthrough paths) — **no verl patch needed**
 
-`vllm_async_server.py` (v0.7.1, ~L215 and ~L326):
+verl retired the SPMD rollout (PR #4411). As of v0.7.1 the vLLM rollout is
+**async-server only**: `vllm_async_server.py :: launch_server()` builds an `args` dict,
+converts it to a `vllm serve` CLI list via `build_cli_args_from_config()`
+(which **JSON-serializes dict values** — so a dict becomes a valid `--speculative-config
+'{...}'`), then calls `AsyncEngineArgs.from_cli_args()`.
 
+### Path B — generic `engine_kwargs` passthrough  ← **what both experiments use**
+
+`launch_server()`:
 ```python
 engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
 ...
-args = { ... , **engine_kwargs }   # merged straight into the vLLM serve args
+args = { ... , **engine_kwargs }      # merged verbatim into the serve args
 ```
+`engine_kwargs.vllm` is a pre-existing empty node (`vllm: {}` in `rollout.yaml`), so new
+children are added with Hydra's `+`. This forwards the spec config exactly like a
+standalone `vllm serve`. Used for **both** RUN 1 (mtp) and RUN 2 (dflash) so they share
+one code path — RUN 1 de-risks the plumbing, RUN 2 only swaps `method` + adds the draft.
 
-So **anything** placed under `rollout.engine_kwargs.vllm.*` is forwarded verbatim to the
-engine. Because dict values get JSON-serialized, we can pass the full DFlash spec config:
-
-**Exact verl config keys for Experiment 2 (DFlash):**
+Exact keys (built key-by-key to dodge Hydra inline-dict / slash quoting):
 ```
-actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={"method":"dflash","model":"z-lab/Qwen3.5-4B-DFlash","num_speculative_tokens":15}
++actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=<mtp|dflash>
++actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.model=<draft repo>     # dflash only
++actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=<N>
 ```
-This reproduces
-`--speculative-config '{"method":"dflash","model":"z-lab/Qwen3.5-4B-DFlash","num_speculative_tokens":15}'`.
+Fallback if Hydra rejects a `+` (key exists): use `++`; or pass the whole dict inline:
+`+...vllm.speculative_config="{method: dflash, model: 'z-lab/Qwen3.5-4B-DFlash', num_speculative_tokens: 15}"`.
 
-Precedence note: the MTP block (Path A) overwrites `args["speculative_config"]` if
-`mtp.enable_rollout` is set. For Exp 2 keep `mtp.enable=False` so Path B is the only
-writer.
+### Path A — verl-native MTP block (NOT used for baselines; it's the co-training path)
 
-## How we'll prove drafting is genuinely ACTIVE (success criterion b)
+`launch_server()` also has a first-class branch:
+```python
+if self.config.mtp.enable and self.config.mtp.enable_rollout:
+    args["speculative_config"] = {"method": self.config.mtp.method,
+                                  "num_speculative_tokens": self.config.mtp.num_speculative_tokens}
+```
+Configured under **`actor_rollout_ref.model.mtp.*`** (rollout.mtp interpolates from it):
+```
+actor_rollout_ref.model.mtp.enable=True
+actor_rollout_ref.model.mtp.enable_rollout=True
+actor_rollout_ref.model.mtp.method=mtp
+actor_rollout_ref.model.mtp.num_speculative_tokens=N
+```
+This path makes **verl manage the MTP/draft weights** in the training model and reshard
+them into the engine — i.e. it's the natural hook for the **drafter re-sync / co-training**
+phase. We deliberately avoid it for the static-draft baselines: all official examples are
+**megatron-only** (`examples/mtp_trainer/*`), so FSDP support is unproven, and it would
+exercise a different path than DFlash. Precedence note: if ever both are set, Path A
+overwrites `args["speculative_config"]`, so keep `model.mtp.enable=False` for RUN 1/2.
 
-verl forwards `disable_log_stats` (rollout config) and has a `prometheus` block. vLLM's
-spec-decode metrics (`vllm:spec_decode_num_accepted_tokens_total`,
-`...num_draft_tokens_total`, acceptance rate, and per-position acceptance) are emitted
-when stats logging is on. Plan: set `rollout.disable_log_stats=False` and scrape the
-engine's acceptance counters / log lines. If `num_speculative_tokens>1` but accepted ==
-0 or the metric is absent, that means silent AR fallback. Exact wiring TBD once the env
-is up and we can see which metrics the installed vLLM emits.
+---
 
-## Blocker to resolve BEFORE running experiments
+## 3. The test ladder (one new variable per rung; required, not optional)
 
-**verl v0.7.1 declares `vllm>=0.8.5,<=0.12.0`** (setup.py `VLLM_REQUIRES`), but
-**DFlash's vLLM `method: dflash` needs vLLM v0.20.1+ / nightly** (DFlash README). The
-ranges don't overlap, so a naive `pip install verl[vllm]` + DFlash won't co-resolve.
+| Run | Script | Spec config | What it proves |
+|-----|--------|-------------|----------------|
+| **0** | `run0_smoke.sh` | none | verl rollout + FSDP weight-resharding/update **survives the vLLM 0.12→0.20+ nightly jump** on a real GRPO step. A `vllm serve` test does NOT cover this. |
+| **1** | `run1_mtp.sh` | `method=mtp, n=2` (Path B) | the generic engine_kwargs → `--speculative-config` plumbing works; native MTP head drafts. |
+| **2** | `run2_dflash.sh` | `method=dflash, model=z-lab/Qwen3.5-4B-DFlash, n=15` (Path B) | DFlash draft loads & drafts through the exact same path. |
 
-Consequences:
-- **Exp 1 (MTP)** does NOT need DFlash or the nightly. It needs verl + a vLLM that both
-  (i) is acceptable to verl's rollout code and (ii) supports Qwen3.5-4B's native MTP.
-  Lower risk — matches "do Exp 1 first."
-- **Exp 2 (DFlash)** needs vLLM nightly ≥0.20.1, which exceeds verl's declared ceiling.
-  verl's rollout is fairly version-decoupled (it just composes CLI args + calls
-  `AsyncEngineArgs`/`AsyncLLM`, with `>=0.13.0` feature guards), so it *may* work against
-  the nightly, but this is untested and the pip pin must be overridden deliberately.
+Order is enforced by us, not the scripts: **do not run 1/2 until the previous rung comes
+back green.** If RUN 0 fails on the nightly and the fix isn't quick → STOP, tell the user;
+we then stand up a separate verl-blessed-vLLM env for the MTP baseline as a parallel track
+(do not build it preemptively).
 
-**Proposed env strategy (to confirm):** one isolated venv built as
-`verl (code) + vLLM nightly + DFlash`, installing verl with its vLLM pin overridden
-(install verl, then force-upgrade vLLM to the DFlash nightly). Try BOTH experiments in
-that single env — MTP works on the nightly too. Fall back to a second venv with a
-verl-blessed vLLM for Exp 1 only if verl turns out to be incompatible with the nightly.
-All resolved versions to be pinned and recorded once installed.
+Tiny by design (prove integration, not convergence): Qwen3.5-4B, gsm8k, train_batch=16,
+n=4, prompt/resp 512, `total_training_steps=3`, tp=1, enforce_eager=True,
+`disable_log_stats=False` (so vLLM emits spec-decode metrics), no save, no val.
+`run0` data via `prepare_data.sh` (verl's own gsm8k preprocessor).
 
-## Open items needing a command run on the remote box
-1. Confirm the verl version we install actually contains the `mtp` block + `engine_kwargs`
-   passthrough (greps provided separately).
-2. Confirm the installed vLLM nightly supports BOTH `method: mtp` (Qwen3.5-4B) and
-   `method: dflash`, and that verl's rollout launches against it without erroring.
-3. Capture which spec-decode acceptance metrics that vLLM build actually emits.
+---
+
+## 4. Success criteria (per spec run) — two independent checks
+
+- **(a) Completes:** GRPO loop runs to `total_training_steps` with no traceback.
+- **(b) Drafting genuinely ACTIVE** — split into two, so "no acceptance metric in a
+  3-step run" is not misread as silent fallback:
+  - **INTEGRATION:** the engine startup / `serve` arg list shows `speculative_config`
+    with the right `method` (`mtp`/`dflash`) and the draft model. Proves config landed.
+  - **BEHAVIOR:** vLLM spec-decode metrics show **accepted tokens > 0 / acceptance rate**
+    (`vllm:spec_decode_num_accepted_tokens_total`, `…num_draft_tokens_total`,
+    draft acceptance rate). Proves the drafter actually engaged, not plain AR.
+
+  Each run script greps the log for both and prints them at the end.
+
+---
+
+## 5. Known risks / things to confirm at runtime
+- **verl × vLLM-nightly compatibility** — UNVERIFIED; RUN 0 is the gate. The `<=0.12.0`
+  ceiling is *avoided* (never resolved, because we skip the `[vllm]` extra via `--no-deps`),
+  not overridden.
+- **Qwen3.5-4B load** under the nightly (target + native MTP head), and that
+  **`z-lab/Qwen3.5-4B-DFlash`** is the right draft repo / not gated (preflight checks both).
+- **Hydra `+` override** for `engine_kwargs.vllm.speculative_config.*` (fallbacks documented in the scripts).
+- **numpy/tensordict pins** applied via requirements.txt (`numpy<2.0.0` :8,
+  `tensordict>=0.8.0,<=0.10.0,!=0.9.0` :16) vs what the nightly pulls — `pip check` in
+  setup surfaces conflicts; runtime may still be fine.
+- Possible spec-decode knobs if drafting errors: `--attention-backend flash_attn`
+  (DFlash README uses it for non-Gemma), `max_num_batched_tokens`. Add only if a run
+  points to them (keeps "one variable per run").
+
+## 6. Open question this phase does NOT close (the crux of the co-training phase)
+Even with all three runs green: **does verl's FSDP weight-sync push the DRAFT / MTP head
+weights into the vLLM engine each step, or only the main policy weights?** Irrelevant for
+these static-draft baselines (the draft is loaded once by the engine and never needs to
+track the policy). But it is exactly the mechanism the drafter re-sync / co-training phase
+depends on — to be investigated next, likely via Path A (`model.mtp.*`), which is where
+verl already manages draft weights for resharding.
