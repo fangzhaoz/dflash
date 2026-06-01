@@ -107,6 +107,28 @@ init but the per-step policy reshard interaction leaves the MTP draft head witho
 weights. CONCLUSION: a real draft-weight path is required (load the draft real AND keep the
 policy reshard from clobbering it AND resync it) — the co-training engineering, not a config flip.
 
+## WHY CONFIG CAN'T FIX IT — sleep/wake + MiMo-MTP (code-grounded, the key result)
+`load_format=auto` for DFlash was also measured **0.000%** (with the patch), even at step 1. Reason
+is the colocated sleep/wake cycle, not the init load:
+- verl colocates the trainer (FSDP: weights+grads+optimizer+ref) and the rollout (vLLM: weights+KV
+  cache) on the SAME GPUs; they can't both fit, so each step they time-share via sleep/wake
+  (`free_cache_engine=True`). Per step: wake+`update_weights` (push current policy) → generate →
+  `sleep` → train actor on the GPU vLLM just freed.
+- Hybrid mode sleeps at **level 2 = DISCARD weights** (not offload), because the policy must be
+  re-synced from the FSDP actor every step anyway. Wake (inside `update_weights`) restores **only
+  what `_iter_all_models()` yields**.
+- `_iter_all_models()` = policy model, PLUS the drafter **iff** `_use_mtp_drafter_weight_sync()`
+  (`method=="mtp"` AND `model_runner.drafter` exists). So the DFlash draft (method!=mtp) is
+  discarded on the first sleep and **never restored** → dummy forever, regardless of init load_format.
+
+**Why MiMo MTP works (the existence proof for the hook):** with `method=="mtp"` on Megatron +
+`model.mtp.enable=True`, the actor's weight stream contains BOTH the policy and the MTP-module
+params, and `_iter_all_models()` yields BOTH the policy model and the MTP drafter — so each wake
+`model.load_weights(weights)` restores both. The MTP draft IS in verl's per-step restore loop →
+survives sleep/wake → stays real (and, with enable_train, synced). DFlash just needs the SAME
+"re-push the draft on every wake," but from its OWN weight source (z-lab checkpoint / co-trained
+drafter) instead of the policy actor's stream. → the injection write-hook, run per-wake.
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:
