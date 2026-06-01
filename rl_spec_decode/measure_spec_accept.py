@@ -160,23 +160,32 @@ class DFlashReproExtension:
     def _get_t(self, owner, attr, is_buf):
         return owner._buffers[attr] if is_buf else getattr(owner, attr, None)
 
+    # Only the small config-derived buffers get zeroed-and-not-restored (rope cos_sin_cache <=64MiB,
+    # attn scales are scalars). Cap well above those but below big weight-like plain-attr tensors so
+    # we (a) don't OOM the GPU and (b) don't clone things load_weights already restores.
+    _BUF_CAP_BYTES = 256 * 1024 * 1024
+
     def capture_buffers(self):
-        """Snapshot nonzero buffers/caches of BOTH main and draft, BEFORE any sleep."""
+        """Snapshot nonzero, small buffers/caches of BOTH main and draft to CPU, BEFORE any sleep."""
         import torch
         self._buf_cache = {}
-        counts = {}
+        out = {}
         for tag, mod in (("main", self.model_runner.model), ("draft", self._draft_model())):
             if mod is None:
-                counts[tag] = None
+                out[tag] = None
                 continue
-            d = {}
+            d, skipped = {}, 0
             for key, owner, attr, is_buf in self._state_tensors(mod):
                 t = self._get_t(owner, attr, is_buf)
-                if isinstance(t, torch.Tensor) and not self._is_zero(t):
-                    d[key] = t.detach().clone()
+                if not (isinstance(t, torch.Tensor) and not self._is_zero(t)):
+                    continue
+                if t.numel() * t.element_size() > self._BUF_CAP_BYTES:
+                    skipped += 1
+                    continue
+                d[key] = t.detach().to("cpu", copy=True)  # CPU to avoid GPU OOM (host RAM is ample)
             self._buf_cache[tag] = d
-            counts[tag] = len(d)
-        return counts
+            out[tag] = {"captured": len(d), "skipped_oversize": skipped}
+        return out
 
     def restore_buffers(self):
         """Copy captured buffers back into any tensor that wake left zeroed."""
