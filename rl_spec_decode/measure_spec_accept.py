@@ -22,7 +22,20 @@ Three paths (run as separate processes; A and B each write a JSON snapshot, then
                             logic is sound, proven); if D drops to ~0% the sleep/wake discard/realloc
                             is the verl culprit (reproduced standalone @ ~10s/iter). --diff A.json D.json
                             then names exactly what wake breaks that the post-wake inject can't restore.
-                            --cycles N repeats sleep/wake to mimic multi-step.
+                            --cycles N repeats sleep/wake to mimic multi-step. RESULT (proven): wake
+                            zeroes config-derived BUFFERS (rope cos_sin_cache, attn scales) that
+                            load_weights doesn't restore; capture-before-sleep + restore-after-wake
+                            recovers 0% -> 38.5%/6.78 == A.
+
+  (E) --mode sleep_wake_recompute : the VERL-FAITHFUL variant + the actual verl fix. Same as D but
+                            the DRAFT gets NO pre-sleep capture (verl's hook fires post-sleep, so there
+                            are no good values to capture); instead the draft's wake-zeroed buffers are
+                            RECOMPUTED from config post-wake (rotary._compute_cos_sin_cache() + scales
+                            reset to 1.0), navigating DIRECTLY to layer.self_attn.{rotary_emb,attn} --
+                            never a broad attr scan (that reaches the Attention op's kv_cache in the
+                            separate KV sleep pool, unmapped at wake -> CUDA illegal access; that scan
+                            crashed verl). Target kept coherent via main-only capture/restore. This is
+                            the exact logic ported into draft_inject_static.patch; expect == A.
 
 Hypothesis under test (instrumented, not assumed): normal init runs _maybe_share_embeddings +
 weight-tying + d2t/buffer build that load_weights-from-dummy skips, so B has the right param
@@ -165,12 +178,14 @@ class DFlashReproExtension:
     # we (a) don't OOM the GPU and (b) don't clone things load_weights already restores.
     _BUF_CAP_BYTES = 256 * 1024 * 1024
 
-    def capture_buffers(self):
-        """Snapshot nonzero, small buffers/caches of BOTH main and draft to CPU, BEFORE any sleep."""
+    def capture_buffers(self, which="both"):
+        """Snapshot nonzero, small buffers/caches to CPU, BEFORE any sleep. which: main|draft|both."""
         import torch
         self._buf_cache = {}
         out = {}
         for tag, mod in (("main", self.model_runner.model), ("draft", self._draft_model())):
+            if which != "both" and tag != which:
+                continue
             if mod is None:
                 out[tag] = None
                 continue
@@ -187,13 +202,15 @@ class DFlashReproExtension:
             out[tag] = {"captured": len(d), "skipped_oversize": skipped}
         return out
 
-    def restore_buffers(self):
-        """Copy captured buffers back into any tensor that wake left zeroed."""
+    def restore_buffers(self, which="both"):
+        """Copy captured buffers back into any tensor that wake left zeroed. which: main|draft|both."""
         import torch
         if not getattr(self, "_buf_cache", None):
             return {"status": "no cache (capture_buffers never ran)"}
         counts = {}
         for tag, mod in (("main", self.model_runner.model), ("draft", self._draft_model())):
+            if which != "both" and tag != which:
+                continue
             if mod is None:
                 continue
             saved = self._buf_cache.get(tag, {})
@@ -208,6 +225,56 @@ class DFlashReproExtension:
                     n += 1
             counts[tag] = n
         return counts
+
+    # --- THE verl FIX: recompute (don't capture) the draft's wake-zeroed config buffers ----------
+    # verl's hook fires at wake = AFTER sleep, so the buffers are already zeroed -> capture can't see
+    # good values. Instead RECOMPUTE from config (timing-independent). And navigate DIRECTLY to the
+    # two orphaned buffer kinds -- per-layer rotary_emb.cos_sin_cache + attn _k/_q/_v/_prob_scale --
+    # NEVER scanning all attrs (that reaches the Attention op's kv_cache in the separate KV sleep pool,
+    # unmapped at wake -> CUDA illegal access; that scan crashed verl). _rope_cos_sin_cache auto-fixes
+    # because _build_fused_kv_buffers aliases it to layer-0's cos_sin_cache (verified in qwen3_dflash.py).
+    def recompute_draft_buffers(self):
+        import torch
+        dm = self._draft_model()
+        if dm is None:
+            return {"status": "no draft"}
+        inner = getattr(dm, "model", dm)
+        layers = getattr(inner, "layers", None)
+        if layers is None:
+            return {"status": "no layers"}
+        rope_done = rope_fail = scale_done = 0
+        last_err = None
+        for layer in layers:
+            sa = getattr(layer, "self_attn", None)
+            if sa is None:
+                continue
+            rotary = getattr(sa, "rotary_emb", None)
+            cache = getattr(rotary, "cos_sin_cache", None) if rotary is not None else None
+            if isinstance(cache, torch.Tensor):
+                try:
+                    # _compute_cos_sin_cache(): no-arg, config-only (base/rotary_dim/max_pos), builds
+                    # fp32 -> we cast to the buffer's device+dtype. Verified in rotary_embedding/base.py.
+                    new = rotary._compute_cos_sin_cache().to(cache.device, cache.dtype)
+                    cache.data.copy_(new)
+                    rope_done += 1
+                except Exception as e:
+                    rope_fail += 1
+                    last_err = f"{type(e).__name__}: {e}"
+            attn = getattr(sa, "attn", None)
+            if attn is not None:
+                for sname in ("_k_scale", "_q_scale", "_v_scale", "_prob_scale"):
+                    s = getattr(attn, sname, None)
+                    if isinstance(s, torch.Tensor) and self._is_zero(s):
+                        s.data.fill_(1.0)
+                        scale_done += 1
+        # re-establish _rope_cos_sin_cache (alias) + fused KV from the now-valid params/cache
+        if hasattr(inner, "_build_fused_kv_buffers"):
+            try:
+                inner._build_fused_kv_buffers()
+            except Exception as e:
+                last_err = last_err or f"rebuild: {type(e).__name__}: {e}"
+        return {"status": "ok", "rope_recomputed": rope_done, "rope_fail": rope_fail,
+                "scales_reset": scale_done, "err": last_err}
 
     def snapshot_draft(self):
         """Object-level snapshot of the draft (WIRING + values). data_ptr only used WITHIN this
@@ -318,7 +385,7 @@ def _measure(llm, prompts, temperature, max_tokens, prev_totals):
     return res, tot
 
 
-def _run_path(args, load_format, do_inject, sleep_wake=False):
+def _run_path(args, load_format, do_inject, sleep_wake=False, recompute=False):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     prompts = [tok.apply_chat_template([{"role": "user", "content": q}],
@@ -326,11 +393,14 @@ def _run_path(args, load_format, do_inject, sleep_wake=False):
     llm = _build_llm(args, load_format, worker_ext=True, enable_sleep=sleep_wake)
 
     if sleep_wake:
-        # Replicate verl's per-step lifecycle: the ONLY variable B-vs-verl omits.
-        # init(dummy) -> [capture good buffers] -> sleep(level=2) DISCARDS engine weights ->
-        # wake re-allocs ZEROED -> (inject restores params) -> [restore buffers].
-        print("[capture] snapshot config-derived buffers BEFORE sleep ...", flush=True)
-        print("  capture_buffers ->", llm.collective_rpc("capture_buffers"), flush=True)
+        # Replicate verl's per-step lifecycle: init(dummy) -> sleep(level=2) DISCARDS engine weights
+        # -> wake re-allocs ZEROED -> (inject restores params) -> fix buffers.
+        # recompute mode (verl-faithful): the DRAFT gets NO pre-sleep capture (verl's hook is post-
+        # sleep); only the MAIN snapshot is kept, so the verification target is coherent. The draft is
+        # fixed solely by the post-wake recompute under test.
+        cap_which = "main" if recompute else "both"
+        print(f"[capture] snapshot config-derived buffers ({cap_which}) BEFORE sleep ...", flush=True)
+        print("  capture_buffers ->", llm.collective_rpc("capture_buffers", args=(cap_which,)), flush=True)
         print(f"[sleep_wake] llm.sleep(level=2) x{args.cycles} cycle(s) ...", flush=True)
         for i in range(args.cycles):
             llm.sleep(level=2)
@@ -341,12 +411,18 @@ def _run_path(args, load_format, do_inject, sleep_wake=False):
     if do_inject:
         print("[inject] loading MAIN real (replicate verl reshard)...", flush=True)
         print("  load_main_real ->", llm.collective_rpc("load_main_real"), flush=True)
+        if sleep_wake and recompute:
+            # restore MAIN buffers so the target is coherent (the draft is left to recompute alone).
+            print("  restore_buffers(main) ->", llm.collective_rpc("restore_buffers", args=("main",)), flush=True)
         print("[inject] running verl hook (inject_draft)...", flush=True)
         inject_status = llm.collective_rpc("inject_draft")
         print("  inject_draft ->", inject_status, flush=True)
+        if recompute:
+            print("[recompute] recompute_draft_buffers (THE verl FIX, post-wake) ...", flush=True)
+            print("  recompute_draft_buffers ->", llm.collective_rpc("recompute_draft_buffers"), flush=True)
 
-    if sleep_wake:
-        # THE FIX under test: copy the captured buffers back into the wake-zeroed tensors.
+    if sleep_wake and not recompute:
+        # mode D: copy the captured (main+draft) buffers back into the wake-zeroed tensors.
         print("[restore] restoring wake-zeroed buffers (main+draft) ...", flush=True)
         print("  restore_buffers ->", llm.collective_rpc("restore_buffers"), flush=True)
 
@@ -357,8 +433,9 @@ def _run_path(args, load_format, do_inject, sleep_wake=False):
     snap = snap[0] if isinstance(snap, list) else snap
 
     result = {"load_format": load_format, "inject": inject_status, "sleep_wake": sleep_wake,
-              "greedy": greedy, "temp1.0": temp1, "snapshot": snap}
-    _label = "sleep_wake_inject" if sleep_wake else ("dummy_inject" if do_inject else "auto")
+              "recompute": recompute, "greedy": greedy, "temp1.0": temp1, "snapshot": snap}
+    _label = ("sleep_wake_recompute" if recompute else "sleep_wake_inject") if sleep_wake \
+        else ("dummy_inject" if do_inject else "auto")
     print("\n================ RESULT (" + _label + ") ================", flush=True)
     for lab in ("greedy", "temp1.0"):
         r = result[lab]
@@ -425,8 +502,9 @@ def _diff(a_path, b_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["measure", "auto", "dummy_inject", "sleep_wake_inject"], default="measure")
-    ap.add_argument("--cycles", type=int, default=1, help="sleep/wake cycles before inject (sleep_wake_inject only)")
+    ap.add_argument("--mode", choices=["measure", "auto", "dummy_inject", "sleep_wake_inject",
+                                        "sleep_wake_recompute"], default="measure")
+    ap.add_argument("--cycles", type=int, default=1, help="sleep/wake cycles before inject")
     ap.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"), default=None)
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--method", default="dflash")
@@ -448,6 +526,8 @@ def main():
         _run_path(args, load_format="dummy", do_inject=True)
     elif args.mode == "sleep_wake_inject":
         _run_path(args, load_format="dummy", do_inject=True, sleep_wake=True)
+    elif args.mode == "sleep_wake_recompute":
+        _run_path(args, load_format="dummy", do_inject=True, sleep_wake=True, recompute=True)
     else:  # legacy single measurement (real weights, given temperature)
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
