@@ -107,6 +107,18 @@ init but the per-step policy reshard interaction leaves the MTP draft head witho
 weights. CONCLUSION: a real draft-weight path is required (load the draft real AND keep the
 policy reshard from clobbering it AND resync it) — the co-training engineering, not a config flip.
 
+## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
+The drafters themselves are strong — these are the targets the in-RL numbers should approach once
+real weights are loaded:
+| Drafter | mean acceptance length | per-draft-token | throughput |
+|---|---|---|---|
+| MTP (n=2)     | **2.74** / 3 max  | 86.8% | 245 tok/s |
+| DFlash (n=15) | **6.88** / 16 max | 39.2% | 437 tok/s |
+DFlash: drafts=302, draft_tokens=4530, accepted=1777 — lower per-token rate than MTP but ~2.5x the
+mean acceptance length (drafts a 15-token block; ~6.9 tokens advanced per target forward pass,
+~1.8x MTP throughput). Both are 0.0% IN the verl rollout purely due to the dummy-weight loading
+gap — the drafters are fine.
+
 ## KEY UNIFIED FINDING (both baselines)
 In the verl GRPO rollout with Path B, **every** speculative draft (MTP head AND DFlash) runs on
 **dummy weights** because verl sets `load_format=dummy` and reshards only the policy → in-rollout
