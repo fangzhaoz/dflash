@@ -104,6 +104,11 @@ else
         "$VLLM_WHEEL" "$TORCH_PIN" \
         --extra-index-url "$VLLM_PYTORCH_INDEX"
 fi
+
+# 4b) qwen-vl-utils — Qwen3.5-4B is a vision model (Qwen3_5ForConditionalGeneration), so verl's
+#     agent-loop rollout imports it for process_vision_info. (verl GEO_REQUIRES; --no-deps skipped
+#     it.) Installed AFTER vLLM so the ENV GATE below still guards torch against any swap.
+pip install qwen-vl-utils
 # =======================================================================
 
 echo
