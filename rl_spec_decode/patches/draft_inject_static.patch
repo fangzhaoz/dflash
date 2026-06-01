@@ -1,6 +1,6 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -204,7 +204,53 @@
+@@ -204,7 +204,73 @@
              model = self.model_runner.model
              model_config = self.model_runner.vllm_config.model_config
              process_weights_after_loading(model, model_config, self.device)
@@ -12,10 +12,11 @@
 +    def _inject_independent_draft_weights(self):
 +        """STATIC-REAL draft injection (verl patch, WRITE-hook; NOT part of the baselines).
 +
-+        Re-load the INDEPENDENT (DFlash) draft's REAL weights from its OWN checkpoint into the live
-+        drafter on every wake (v0.7.1 restores only the policy; sleep(level=2) discards the draft).
-+        Self-verifying via in-place param-NORM delta: 'changed' = params actually loaded, 'unchanged'
-+        = params NOT loaded (the likely-broken ones). Does NOT touch policy/sampling/spec/sync.
++        v0.7.1 restores only the policy and sleep(level=2) discards the draft, so re-load the
++        INDEPENDENT (DFlash) draft each wake from (a) its OWN checkpoint for the diffusion network,
++        and (b) the TARGET's real embedding for embed_tokens (DFlash omits embed_tokens from its
++        checkpoint and relies on vLLM sharing the target's, but that init heuristic breaks under
++        load_format=dummy). Frozen/static for now. Self-verifying via in-place norm delta.
 +        """
 +        try:
 +            spec = self.model_runner.vllm_config.speculative_config
@@ -30,22 +31,41 @@
 +                return
 +            from vllm.config import LoadConfig
 +            from vllm.model_executor.model_loader import get_model_loader
- 
++
 +            params = dict(draft_model.named_parameters())
 +            before = {n: float(p.detach().float().norm()) for n, p in params.items()}
 +            loader = get_model_loader(LoadConfig(load_format="auto"))
 +            draft_model.load_weights(loader.get_all_weights(draft_cfg, draft_model))
++            inner = getattr(draft_model, "model", None)
++
++            # Copy the REAL target (policy) input embedding into the draft's embed_tokens, since
++            # DFlash shares it and the init-time sharing heuristic fails under load_format=dummy.
++            embed_status = "skip"
++            try:
++                tgt_embed = self.model_runner.model.get_input_embeddings() \
++                    if hasattr(self.model_runner.model, "get_input_embeddings") else None
++                dft_embed = getattr(inner, "embed_tokens", None)
++                if tgt_embed is not None and dft_embed is not None \
++                        and tuple(tgt_embed.weight.shape) == tuple(dft_embed.weight.shape):
++                    dft_embed.weight.data.copy_(tgt_embed.weight.data.to(dft_embed.weight.dtype))
++                    embed_status = "copied"
++                else:
++                    ts = None if tgt_embed is None else tuple(tgt_embed.weight.shape)
++                    ds = None if dft_embed is None else tuple(dft_embed.weight.shape)
++                    embed_status = f"shape_mismatch tgt={ts} dft={ds}"
++            except Exception as ee:
++                embed_status = f"err {type(ee).__name__}: {ee}"
+ 
 +            changed = [n for n, p in params.items()
 +                       if abs(float(p.detach().float().norm()) - before[n]) > 1e-6]
-+            changed_set = set(changed)
-+            unchanged = [n for n in before if n not in changed_set]
-+            inner = getattr(draft_model, "model", None)
++            unchanged = [n for n in before if n not in set(changed)]
 +            rebuilt = False
 +            if inner is not None and hasattr(inner, "_build_fused_kv_buffers"):
 +                inner._build_fused_kv_buffers()
 +                rebuilt = True
 +            print(f"[DRAFT-INJECT] model={getattr(draft_cfg, 'model', '?')} params={len(before)} "
-+                  f"changed={len(changed)} unchanged={len(unchanged)} rebuilt={rebuilt}", flush=True)
++                  f"changed={len(changed)} unchanged={len(unchanged)} embed={embed_status} "
++                  f"rebuilt={rebuilt}", flush=True)
 +            print(f"[DRAFT-INJECT] unchanged_sample={unchanged[:8]}", flush=True)
 +        except Exception as e:
 +            import traceback

@@ -146,8 +146,16 @@ Re-loads real z-lab DFlash weights into the live drafter each wake.
   weights landing partially/wrong ("ran but didn't take"). Diagnostics too weak: `load_weights`
   returns None (so loaded-count was -1, uninformative); `qwen3_dflash.py:363` buffer warning is at
   init dummy_run (likely benign). Hypothesis: partial load / name mismatch on the diffusion core.
-- Attempt 2 (pending): enhanced hook measures the load by in-place param-NORM delta — reports
-  `changed`/`unchanged` param counts + sample unchanged names → pinpoints what didn't load.
+- Attempt 2 (norm-delta diag): `params=44 changed=43 unchanged=1`, the ONE unchanged =
+  `model.embed_tokens.weight`. Acceptance still ~0.17%. So the diffusion core/fc/lm_head all loaded
+  real; only the draft INPUT EMBEDDING stayed dummy.
+- ROOT CAUSE (code): DFlash omits `embed_tokens` from its checkpoint and relies on vLLM's
+  `_maybe_share_embeddings` (llm_base_proposer.py:1273) to share the TARGET's embedding. That init
+  heuristic does `torch.equal(target_embed, draft_embed)` — under verl's `load_format=dummy` both are
+  *different dummy tensors*, so it fails → draft keeps a SEPARATE dummy embedding → every drafted
+  token is garbage → ~0%. (This is the dummy-init breaking the share, specific to the verl path.)
+- Attempt 3 (fix): hook now also COPIES the real (resharded) target `get_input_embeddings()` into the
+  draft `embed_tokens` each wake (shape-guarded), bypassing the broken heuristic. ⬜ verify number.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
