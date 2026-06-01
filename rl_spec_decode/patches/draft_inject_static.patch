@@ -1,10 +1,9 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -204,7 +204,73 @@
-             model = self.model_runner.model
+@@ -205,6 +205,77 @@
              model_config = self.model_runner.vllm_config.model_config
              process_weights_after_loading(model, model_config, self.device)
-+
+ 
 +        # verl patch (WRITE-hook): re-load the independent (DFlash) draft's real weights each
 +        # wake, since sleep(level=2) discards them and verl restores only the policy.
 +        self._inject_independent_draft_weights()
@@ -12,11 +11,10 @@
 +    def _inject_independent_draft_weights(self):
 +        """STATIC-REAL draft injection (verl patch, WRITE-hook; NOT part of the baselines).
 +
-+        v0.7.1 restores only the policy and sleep(level=2) discards the draft, so re-load the
-+        INDEPENDENT (DFlash) draft each wake from (a) its OWN checkpoint for the diffusion network,
-+        and (b) the TARGET's real embedding for embed_tokens (DFlash omits embed_tokens from its
-+        checkpoint and relies on vLLM sharing the target's, but that init heuristic breaks under
-+        load_format=dummy). Frozen/static for now. Self-verifying via in-place norm delta.
++        Re-load the INDEPENDENT (DFlash) draft each wake: (a) its diffusion net from its OWN
++        checkpoint, and (b) its embed_tokens from the TARGET's real embedding (DFlash omits embed
++        from its checkpoint and relies on vLLM sharing the target's, which breaks under
++        load_format=dummy). The target embed is found by name+shape. Self-verifying via norm delta.
 +        """
 +        try:
 +            spec = self.model_runner.vllm_config.speculative_config
@@ -38,24 +36,30 @@
 +            draft_model.load_weights(loader.get_all_weights(draft_cfg, draft_model))
 +            inner = getattr(draft_model, "model", None)
 +
-+            # Copy the REAL target (policy) input embedding into the draft's embed_tokens, since
-+            # DFlash shares it and the init-time sharing heuristic fails under load_format=dummy.
++            # Copy the REAL target (policy) input embedding into the draft's embed_tokens. Find the
++            # target embed by name+shape (get_input_embeddings() returns None on this VL model).
 +            embed_status = "skip"
 +            try:
-+                tgt_embed = self.model_runner.model.get_input_embeddings() \
-+                    if hasattr(self.model_runner.model, "get_input_embeddings") else None
 +                dft_embed = getattr(inner, "embed_tokens", None)
-+                if tgt_embed is not None and dft_embed is not None \
-+                        and tuple(tgt_embed.weight.shape) == tuple(dft_embed.weight.shape):
-+                    dft_embed.weight.data.copy_(tgt_embed.weight.data.to(dft_embed.weight.dtype))
-+                    embed_status = "copied"
++                if dft_embed is None:
++                    embed_status = "no_draft_embed"
 +                else:
-+                    ts = None if tgt_embed is None else tuple(tgt_embed.weight.shape)
-+                    ds = None if dft_embed is None else tuple(dft_embed.weight.shape)
-+                    embed_status = f"shape_mismatch tgt={ts} dft={ds}"
++                    want = tuple(dft_embed.weight.shape)
++                    tgt_w = None
++                    for n, p in self.model_runner.model.named_parameters():
++                        if n.endswith("embed_tokens.weight") and tuple(p.shape) == want:
++                            tgt_w = p
++                            break
++                    if tgt_w is not None:
++                        dft_embed.weight.data.copy_(tgt_w.data.to(dft_embed.weight.dtype))
++                        embed_status = "copied"
++                    else:
++                        cand = [n for n, p in self.model_runner.model.named_parameters()
++                                if "embed" in n.lower()]
++                        embed_status = f"no_target_embed want={want} candidates={cand[:5]}"
 +            except Exception as ee:
 +                embed_status = f"err {type(ee).__name__}: {ee}"
- 
++
 +            changed = [n for n, p in params.items()
 +                       if abs(float(p.detach().float().norm()) - before[n]) > 1e-6]
 +            unchanged = [n for n in before if n not in set(changed)]
