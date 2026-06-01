@@ -31,7 +31,10 @@ grep -i 'SPEC-ACCEPT' rl_spec_decode/logs/run1_mtp.log | tail -20
 cd "$VERL_DIR" && git apply -R "$DFLASH_DIR/rl_spec_decode/patches/spec_accept_measurement.patch"
 ```
 
-The last `[SPEC-ACCEPT ...]` line per replica gives the full-run cumulative numbers; the
-`per_draft_token_acceptance` field is the in-rollout acceptance rate. If NO `[SPEC-ACCEPT]`
-lines appear, the spec_decode metrics aren't in the front-end Prometheus registry in this build
-— tell me and I'll add a `self.engine.get_metrics()` fallback.
+The hook ALWAYS logs a `[SPEC-ACCEPT per-step] ...` line each step (heartbeat). vLLM resets
+the spec-decode counters on each wake_up, so each line is THAT step's acceptance, not cumulative
+— read the steady-state steps (2–3), not step 1 (cold-start/JIT warmup). The
+`per_draft_token_acceptance` field is the in-rollout acceptance rate. The line also dumps
+`info` (incl. `logger_types`), `registry`, and `accum` so we can see exactly which source has
+the data. If NO `[SPEC-ACCEPT]` lines appear at all, the patch isn't being picked up (confirm
+it's applied; verl is editable so no reinstall is needed).
