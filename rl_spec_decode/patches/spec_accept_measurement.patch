@@ -1,24 +1,24 @@
 --- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
 +++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-@@ -626,7 +626,68 @@
+@@ -625,8 +625,67 @@
+             await self.engine.reset_prefix_cache()
          elif self.rollout_mode == RolloutMode.STANDALONE:
              logger.info("skip wake_up in standalone mode")
- 
++
 +    async def _log_spec_decode_metrics(self):
 +        """READ-ONLY measurement hook (verl patch, NOT part of the baseline runs).
 +
 +        Logs per-step in-rollout spec-decode acceptance. vLLM resets these counters on each
-+        wake_up (free_cache_engine), so each line reflects THAT step's generation, not a
-+        cumulative total. Does NOT alter generation, sampling, spec config, or weight sync.
-+        ALWAYS logs a heartbeat (so 'no output' means the hook never ran). Requires
-+        rollout.disable_log_stats=False.
++        wake_up (free_cache_engine), so each line reflects THAT step's generation. Uses print()
++        (not logger.info) because this Ray-actor process has no INFO logging handler, so INFO
++        records are dropped. Does NOT alter generation, sampling, spec config, or weight sync.
++        ALWAYS prints a heartbeat. Requires rollout.disable_log_stats=False.
 +        """
 +        try:
 +            def _sum(obj, attr):
 +                return int(sum(getattr(obj, attr, []) or []))
-+
+ 
 +            info = {"replica": self.replica_rank}
-+            # Source 1: prometheus default registry (reset per wake_up -> this step's totals).
 +            reg = {}
 +            try:
 +                from prometheus_client import REGISTRY
@@ -29,7 +29,6 @@
 +                        )
 +            except Exception as e:
 +                info["registry_err"] = repr(e)
-+            # Source 2: the engine's StatLoggerManager spec-decode accumulators.
 +            acc = {}
 +            try:
 +                lm = getattr(self.engine, "logger_manager", None)
@@ -55,14 +54,14 @@
 +            accepted = reg.get("vllm:spec_decode_num_accepted_tokens")
 +            if accepted is None:
 +                accepted = acc.get("num_accepted_tokens")
-+            msg = f"[SPEC-ACCEPT per-step] info={info} registry={reg} accum={acc}"
++            msg = f">>> SPEC-ACCEPT per-step info={info} registry={reg} accum={acc}"
 +            if draft_tokens and accepted is not None and draft_tokens > 0:
 +                msg += f" | per_draft_token_acceptance={accepted / draft_tokens:.3%}"
 +            if drafts and accepted is not None and drafts > 0:
 +                msg += f" | mean_acceptance_length={accepted / drafts + 1.0:.3f}"
-+            logger.info(msg)
++            print(msg, flush=True)
 +        except Exception as e:
-+            logger.warning(f"[SPEC-ACCEPT] hook failed: {e}")
++            print(f">>> SPEC-ACCEPT hook failed: {e}", flush=True)
 +
      async def sleep(self):
 +        await self._log_spec_decode_metrics()  # READ-ONLY measurement (verl patch; rl_spec_decode)
