@@ -1,6 +1,6 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -205,6 +205,137 @@
+@@ -205,6 +205,128 @@
              model_config = self.model_runner.vllm_config.model_config
              process_weights_after_loading(model, model_config, self.device)
 
@@ -68,9 +68,9 @@
 +                inner._build_fused_kv_buffers()
 +                rebuilt = True
 +            # THE FIX: restore the config-derived buffers that sleep(level=2) zeroed and load_weights
-+            # does NOT repopulate (rope caches + attn scales). Without this, the draft is positionally
-+            # blind -> ~0% acceptance (the verl symptom). Proven in measure_spec_accept.py mode D.
-+            self._sync_draft_buffers(draft_model)
++            # does NOT repopulate (rope cos_sin_cache + attn scales). Without this the draft is
++            # positionally blind -> ~0% acceptance. Proven == init in measure_spec_accept.py mode E.
++            self._recompute_draft_buffers(draft_model)
 +            print(f"[DRAFT-INJECT] model={getattr(draft_cfg, 'model', '?')} params={len(before)} "
 +                  f"changed={len(changed)} unchanged={len(unchanged)} embed={embed_status} "
 +                  f"rebuilt={rebuilt}", flush=True)
@@ -79,58 +79,49 @@
 +            import traceback
 +            print(f"[DRAFT-INJECT] FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
 +
-+    def _sync_draft_buffers(self, draft_model):
-+        """Restore config-derived draft buffers that sleep(level=2) zeroes and load_weights does
-+        NOT repopulate (rope cos_sin_cache, DFlash _rope_cos_sin_cache, attn _k/_q/_v/_prob_scale).
-+        Constants computed at init (valid even under dummy); clone them the first time we see them
-+        nonzero (CPU, <=256MiB each), copy them back into the zeroed tensors on every wake. Proven
-+        in rl_spec_decode/measure_spec_accept.py --mode sleep_wake_inject (0% -> 38.5%/6.78, ==init)."""
-+        import torch
-+        CAP = 256 * 1024 * 1024
-+
-+        def state_tensors(root):
-+            for mod_name, mod in root.named_modules():
-+                for bname, b in list(mod._buffers.items()):
-+                    if isinstance(b, torch.Tensor):
-+                        yield (mod_name + ".#buf#." + bname, mod, bname, True)
-+                for aname, a in list(vars(mod).items()):
-+                    if isinstance(a, torch.Tensor) and aname not in mod._buffers:
-+                        yield (mod_name + ".#attr#." + aname, mod, aname, False)
-+
-+        def get_t(owner, attr, is_buf):
-+            return owner._buffers[attr] if is_buf else getattr(owner, attr, None)
-+
-+        def is_zero(t):
-+            try:
-+                return float(t.detach().float().norm()) == 0.0
-+            except Exception:
-+                return False
-+
++    def _recompute_draft_buffers(self, draft_model):
++        """Restore the draft's wake-zeroed config-derived buffers. sleep(level=2) frees ALL engine
++        memory; wake re-maps it ZEROED; load_weights restores only PARAMETERS, leaving per-layer
++        rotary_emb.cos_sin_cache (positionally critical) + attn _k/_q/_v/_prob_scale at zero -> draft
++        positionally blind -> ~0% acceptance. RECOMPUTE from config (the hook fires post-sleep, so
++        there are no good values to capture) and navigate DIRECTLY to layer.self_attn.{rotary_emb,attn}
++        -- NEVER scan all attrs (that reaches the Attention op's kv_cache in the separate KV sleep
++        pool, unmapped at wake -> CUDA illegal access). _rope_cos_sin_cache aliases layer-0's cache
++        (qwen3_dflash.py:317) so it auto-fixes. Proven == init in measure_spec_accept.py mode E."""
 +        try:
-+            cache = getattr(self, "_draft_buf_cache", None)
-+            if cache is None:
-+                cache = {}
-+                for key, owner, attr, is_buf in state_tensors(draft_model):
-+                    t = get_t(owner, attr, is_buf)
-+                    if isinstance(t, torch.Tensor) and not is_zero(t) and t.numel() * t.element_size() <= CAP:
-+                        cache[key] = t.detach().to("cpu", copy=True)
-+                if cache:
-+                    self._draft_buf_cache = cache
-+                    print(f"[DRAFT-BUF] captured {len(cache)} config-derived buffers (pre-sleep)", flush=True)
-+                else:
-+                    print("[DRAFT-BUF] WARNING: nothing to capture (hook ran after sleep zeroed "
-+                          "buffers); cannot restore by capture -> recompute path needed", flush=True)
-+                    return
-+            restored = 0
-+            for key, owner, attr, is_buf in state_tensors(draft_model):
-+                s = cache.get(key)
-+                if s is None:
++            import torch
++            inner = getattr(draft_model, "model", draft_model)
++            layers = getattr(inner, "layers", None)
++            if layers is None:
++                print("[DRAFT-BUF] skip: no draft layers", flush=True)
++                return
++            rope_done = rope_fail = scale_done = 0
++            last_err = None
++            for layer in layers:
++                sa = getattr(layer, "self_attn", None)
++                if sa is None:
 +                    continue
-+                t = get_t(owner, attr, is_buf)
-+                if isinstance(t, torch.Tensor) and tuple(t.shape) == tuple(s.shape) and is_zero(t):
-+                    t.data.copy_(s.to(t.device, t.dtype))
-+                    restored += 1
-+            print(f"[DRAFT-BUF] restored {restored} wake-zeroed buffers into the live draft", flush=True)
++                rotary = getattr(sa, "rotary_emb", None)
++                cache = getattr(rotary, "cos_sin_cache", None) if rotary is not None else None
++                if isinstance(cache, torch.Tensor):
++                    try:
++                        new = rotary._compute_cos_sin_cache().to(cache.device, cache.dtype)
++                        cache.data.copy_(new)
++                        rope_done += 1
++                    except Exception as e:
++                        rope_fail += 1
++                        last_err = f"{type(e).__name__}: {e}"
++                attn = getattr(sa, "attn", None)
++                if attn is not None:
++                    for sname in ("_k_scale", "_q_scale", "_v_scale", "_prob_scale"):
++                        s = getattr(attn, sname, None)
++                        if isinstance(s, torch.Tensor) and float(s.detach().float().norm()) == 0.0:
++                            s.data.fill_(1.0)
++                            scale_done += 1
++            if hasattr(inner, "_build_fused_kv_buffers"):
++                inner._build_fused_kv_buffers()
++            print(f"[DRAFT-BUF] rope_recomputed={rope_done} rope_fail={rope_fail} "
++                  f"scales_reset={scale_done} err={last_err}", flush=True)
 +        except Exception as e:
 +            import traceback
 +            print(f"[DRAFT-BUF] FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)

@@ -187,9 +187,36 @@ Built the standalone A/B/C/D isolation in `measure_spec_accept.py` (no verl, ~10
   **D fully recovers to A** (greedy 0.385 / 6.78; all buffers + params match). Diagnosis + fix confirmed.
   Implemented as `capture_buffers`/`restore_buffers` in `measure_spec_accept.py` (mode `sleep_wake_inject`).
 - IMPLICATION for verl: the existing `draft_inject_static.patch` (params + embed + fused) is necessary
-  but INSUFFICIENT — it must ALSO restore the wake-zeroed config buffers. Porting capture/restore into
-  the verl worker-extension hook now (the one open wrinkle: verl's hook fires at wake = after sleep, so
-  capture must grab the good values at the first wake that precedes any sleep, else fall back to recompute).
+  but INSUFFICIENT — it must ALSO restore the wake-zeroed config buffers.
+
+## VERL PORT: capture CRASHED → switched to RECOMPUTE (proven mode E), the final fix
+First port used the mode-D capture/restore in the verl hook. RESULT: **CUDA illegal memory access**,
+engine dead (`[DRAFT-BUF] FAILED: ... illegal memory access` at `t.detach().to("cpu")`). Two grounded reasons:
+- **Capture can't work in verl at all:** the hook fires inside `update_weights_from_ipc` = at WAKE = AFTER
+  sleep, so the buffers are already zeroed the first time it runs → nothing good to capture (the wake-timing
+  caveat, now confirmed, not hypothetical).
+- **The broad `vars(mod)` attr scan is unsafe in verl:** walking ALL tensor attrs reaches the vLLM
+  `Attention` op's `kv_cache`, which lives in the SEPARATE KV sleep pool (unmapped at the hook moment in
+  verl's colocate wake) → touching it = illegal access. (Standalone mode D didn't crash because
+  `llm.wake_up()` re-maps EVERYTHING; verl's wake doesn't.)
+- Also learned: `restore_buffers(main) -> 0` in mode E → the MAIN model's buffers survive wake on their own
+  (matches target working in RUN 0/1/2). The **draft is the only orphan**; the patch touches only the draft.
+
+**FIX = RECOMPUTE (not capture), targeted navigation (not scan).** DFlash source (`qwen3_dflash.py`) +
+vLLM `rotary_embedding/base.py` (both read, not inferred) show: the only orphaned draft state is per-layer
+`rotary_emb.cos_sin_cache` + attn `_k/_q/_v/_prob_scale`, and `_rope_cos_sin_cache` is just an ALIAS to
+layer-0's `cos_sin_cache` (line 317) → auto-fixes. `_recompute_draft_buffers` navigates DIRECTLY to
+`layer.self_attn.{rotary_emb,attn}`, recomputes the cache via `rotary._compute_cos_sin_cache()` (no-arg,
+config-only — independent of weights/timing), resets zeroed scales to 1.0, re-runs `_build_fused_kv_buffers`.
+NEVER scans attrs → never touches kv_cache → no crash by construction (only weights-pool buffers that
+`load_weights` already proved mapped).
+- PROVEN standalone, `measure_spec_accept.py --mode sleep_wake_recompute` (mode E, VERL-FAITHFUL timing:
+  no draft pre-capture; target coherent via main-only capture/restore): `recompute_draft_buffers ->
+  rope_recomputed=5 rope_fail=0 scales_reset=20 err=None`, acceptance **0% → greedy 0.385/6.78,
+  temp1.0 0.292/5.37 (== auto-init A)**, `--diff A vs E` all buffers+params match. This exact logic is the
+  verl patch (`draft_inject_static.patch`, hunk `@@ -205,6 +205,128 @@`, mechanically gate-verified).
+- NEXT: run it in real verl (RUN 2 + measurement patch); success = `[SPEC-ACCEPT per-step]` on steps 2–3
+  moving from ~0.0016 toward ~0.39, and `[DRAFT-BUF] rope_recomputed=5 rope_fail=0`.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
