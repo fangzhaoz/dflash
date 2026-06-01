@@ -127,19 +127,24 @@ cd "$DFLASH_DIR"
 VERL_DIR=${VERL_DIR:-$HOME/verl}
 DFLASH_DIR=$(pwd)
 
-# apply
+# --- apply both patches (they handle BOTH methods, mtp and dflash) ---
 cd "$VERL_DIR"
 git apply "$DFLASH_DIR/rl_spec_decode/patches/spec_accept_measurement.patch"
 git apply "$DFLASH_DIR/rl_spec_decode/patches/draft_inject_static.patch"
 
-# RUN 1 = MTP  (or rl_spec_decode/run2_dflash.sh for DFlash)
+# --- RUN 1: MTP (num_speculative_tokens=2) ---
 cd "$DFLASH_DIR"
 bash rl_spec_decode/run1_mtp.sh 2>&1 | tee rl_spec_decode/logs/run1.log
-
-# pull the key lines out
 grep -iE 'DRAFT-BUF|DRAFT-INJECT|SPEC-ACCEPT' rl_spec_decode/logs/run1.log
+#   expect: per_draft_token_acceptance ~88%, mean_acceptance_length ~2.77
 
-# revert (back to baseline verl)
+# --- RUN 2: DFlash (method=dflash, draft=z-lab/Qwen3.5-4B-DFlash, num_speculative_tokens=15) ---
+cd "$DFLASH_DIR"
+bash rl_spec_decode/run2_dflash.sh 2>&1 | tee rl_spec_decode/logs/run2.log
+grep -iE 'DRAFT-BUF|DRAFT-INJECT|SPEC-ACCEPT' rl_spec_decode/logs/run2.log
+#   expect: per_draft_token_acceptance ~38.5%, mean_acceptance_length ~6.78
+
+# --- revert both (back to baseline verl) ---
 cd "$VERL_DIR"
 git apply -R "$DFLASH_DIR/rl_spec_decode/patches/draft_inject_static.patch"
 git apply -R "$DFLASH_DIR/rl_spec_decode/patches/spec_accept_measurement.patch"
@@ -154,8 +159,8 @@ What success looks like (steady state, across the 3 steps / 8 replicas):
   - **MTP → ~88% / ~2.77**
   - **DFlash → ~38.5% / ~6.78**
 
-i.e. the Step-2 inference numbers, now **inside RL training**. (For DFlash use `run2_dflash.sh`,
-which sets `method=dflash`, the draft repo, and `num_speculative_tokens=15`.)
+i.e. the Step-2 inference numbers, now **inside RL training** — RUN 1 reproduces the MTP row,
+RUN 2 the DFlash row.
 
 > Baseline check (optional): run `run1_mtp.sh` **without** the `draft_inject_static.patch`
 > (measurement patch only) and you'll see `per_draft_token_acceptance ≈ 0` — that's the dummy-weight
