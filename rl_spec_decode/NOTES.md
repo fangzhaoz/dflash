@@ -129,6 +129,15 @@ survives sleep/wake → stays real (and, with enable_train, synced). DFlash just
 "re-push the draft on every wake," but from its OWN weight source (z-lab checkpoint / co-trained
 drafter) instead of the policy actor's stream. → the injection write-hook, run per-wake.
 
+**VERSION CORRECTION (verified):** the `_iter_all_models` / `_use_mtp_drafter_weight_sync`
+MTP-drafter sync described just above is in verl **`main`**, NOT the remote's **`v0.7.1`**. v0.7.1's
+worker extension (`vLLMColocateWorkerExtension._update_weights`, utils.py:208) loads **only
+`self.model_runner.model`** (the policy) — it has **no drafter handling whatsoever**. So on the
+actual remote, the draft is never synced for ANY method (even MTP), which matches every 0%
+measurement. Conclusion unchanged (per-wake draft injection required); the MiMo-MTP "both restored"
+description applies to newer verl, not the box we're on. The injection patch is built against the
+real v0.7.1 file (`draft_inject_static.patch`).
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:

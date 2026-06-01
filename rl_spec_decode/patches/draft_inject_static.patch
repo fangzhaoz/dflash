@@ -1,8 +1,8 @@
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -259,6 +259,51 @@
-             for model, model_config in self._iter_all_models_with_config():
-                 process_weights_after_loading(model, model_config, self.device)
+@@ -205,6 +205,51 @@
+             model_config = self.model_runner.vllm_config.model_config
+             process_weights_after_loading(model, model_config, self.device)
  
 +        # verl patch (WRITE-hook): re-load the independent (DFlash) draft's real weights each
 +        # wake, since sleep(level=2) discards them and verl restores only the policy.
@@ -11,17 +11,17 @@
 +    def _inject_independent_draft_weights(self):
 +        """STATIC-REAL draft injection (verl patch, WRITE-hook; NOT part of the baselines).
 +
-+        verl's sleep(level=2)/wake cycle discards engine weights each step and only restores the
-+        policy (`_iter_all_models` excludes non-MTP drafts). For an INDEPENDENT draft (DFlash),
-+        re-load its REAL weights from its OWN checkpoint into the live drafter on every wake.
-+        Frozen/static for now (co-training swaps the weight source later). Self-verifying: prints
-+        how many draft params were loaded (0 == name mismatch / silent no-op). Read-then-write;
-+        does NOT touch the policy, sampling, spec config, or the policy weight-sync.
++        v0.7.1's update_weights_from_ipc restores only the policy (self.model_runner.model); the
++        sleep(level=2)/wake cycle discards engine weights each step, so an INDEPENDENT draft (DFlash)
++        is never given real weights. Re-load its REAL weights from its OWN checkpoint into the live
++        drafter on every wake. Frozen/static for now (co-training swaps the weight source later).
++        Self-verifying: prints how many draft params were loaded (0 == name mismatch / silent no-op).
++        Does NOT touch the policy, sampling, spec config, or the policy weight-sync.
 +        """
 +        try:
 +            spec = self.model_runner.vllm_config.speculative_config
 +            if spec is None or getattr(spec, "method", None) != "dflash":
-+                return  # only the independent-draft (dflash) case; MTP is handled by verl's sync
++                return  # only the independent-draft (dflash) case
 +            drafter = getattr(self.model_runner, "drafter", None)
 +            draft_model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
 +            draft_cfg = getattr(spec, "draft_model_config", None)
