@@ -68,6 +68,7 @@ def main():
         gpu_memory_utilization=args.gpu_mem_util,
         max_model_len=args.max_model_len,
         max_num_seqs=len(prompts),
+        disable_log_stats=False,  # REQUIRED for llm.get_metrics() (offline LLM disables it by default)
         # load_format defaults to "auto" -> REAL weights (incl. MTP head), unlike the verl run.
     )
 
