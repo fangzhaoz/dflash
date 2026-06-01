@@ -18,10 +18,11 @@ Purpose: get the **in-rollout** MTP/DFlash acceptance number directly, instead o
 
 Adds `_inject_independent_draft_weights()` to `vLLMColocateWorkerExtension`
 (`verl/workers/rollout/vllm_rollout/utils.py`), called at the end of `update_weights_from_ipc`
-(the per-wake policy-restore path). For `method=="dflash"` only, it re-loads the **real** DFlash
-draft weights from the draft's own checkpoint (`load_format=auto`, bypassing the engine's `dummy`)
-into the live `model_runner.drafter.model` on every wake, then rebuilds the fused KV buffers
-(`_build_fused_kv_buffers`). This counters the sleep(level=2)/wake cycle that discards engine
+(the per-wake policy-restore path). For `method in {dflash, mtp}`, it re-loads the **real** draft
+weights from the draft's checkpoint (`load_format=auto`, bypassing the engine's `dummy`) into the
+live `model_runner.drafter.model` on every wake — for DFlash that's the z-lab repo, for MTP it's the
+Qwen3.5-4B target checkpoint (the MTP head lives there) — then rebuilds the fused KV buffers if present
+(`_build_fused_kv_buffers`; DFlash only). This counters the sleep(level=2)/wake cycle that discards engine
 weights and restores only the policy. STATIC/frozen weights for now (co-training swaps the source).
 
 **Buffer fix (`_recompute_draft_buffers`, the part that actually makes it work).** Re-loading params

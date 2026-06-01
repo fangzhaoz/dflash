@@ -234,6 +234,24 @@ Applied `draft_inject_static.patch` (recompute) + `spec_accept_measurement.patch
   the moving AR policy. The injection hook is the natural place to swap the static checkpoint for the
   co-trained drafter as the weight source.
 
+## ✅ MTP (Qwen3.5-4B native head) — same fix generalizes, PROVEN standalone
+Goal extended: get Qwen's own MTP spec-decode working in-rollout too (RUN 1 was 0% for the SAME
+dummy-weight+zeroed-buffer reason). Introspected the MTP drafter (`--mode introspect --method mtp`):
+class `Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor`, weight source `draft_cfg_model=Qwen/Qwen3.5-4B` (MTP head
+lives in the TARGET checkpoint), 13 params (fc + ONE `layers.0` block + norms + embed_tokens), and the
+SAME orphaned buffers DFlash has — `layers.0.self_attn.rotary_emb.cos_sin_cache` (MRotaryEmbedding, has
+`_compute_cos_sin_cache`) + `attn._{k,q,v,prob}_scale`. `has_build_fused_kv=False` (hasattr-guarded).
+→ `_recompute_draft_buffers` fits MTP with ZERO changes; only generalization needed = un-gate inject from
+`method=="dflash"` to `method in {dflash, mtp}` (one line, in both the harness and the patch).
+- PROVEN standalone (`--method mtp --num-spec-tokens 2 --draft-model ""`): mode A (auto) greedy 0.8715/2.743,
+  temp1.0 0.8015/2.603; mode E (sleep_wake_recompute, verl-faithful) **== A bit-for-bit**;
+  `recompute_draft_buffers -> rope_recomputed=1 rope_fail=0 scales_reset=4 err=None`,
+  `inject_draft -> changed=12 unchanged=1(embed) embed=copied`; `--diff` all params/buffers match (only a
+  5e-4 bf16 rounding blip on cos_sin_cache norm). So real MTP weights + recomputed buffers fully recover.
+- verl patch `draft_inject_static.patch` generalized (gate `not in ("dflash","mtp")`); hunk count unchanged
+  (`@@ -205,6 +205,128 @@`), 5 gates re-verified. NEXT: RUN 1 (mtp) in real verl + measurement; expect
+  `[SPEC-ACCEPT]` ~0% → ~80–87% (mean-len ~2.6–2.74) and `[DRAFT-BUF] rope_recomputed=1 scales_reset=4`.
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:
