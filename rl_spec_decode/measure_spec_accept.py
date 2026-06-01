@@ -108,8 +108,8 @@ class DFlashReproExtension:
         """The EXACT verl write-hook logic."""
         try:
             spec = self.model_runner.vllm_config.speculative_config
-            if spec is None or getattr(spec, "method", None) != "dflash":
-                return {"status": "skip (not dflash)"}
+            if spec is None or getattr(spec, "method", None) not in ("dflash", "mtp"):
+                return {"status": "skip (not dflash/mtp)"}
             draft_model = self._draft_model()
             draft_cfg = getattr(spec, "draft_model_config", None)
             if draft_model is None or draft_cfg is None:
