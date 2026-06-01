@@ -58,11 +58,18 @@ driver 535.261.03.
   during inference — `rejection_greedy_sample_kernel` (verify/accept), `eagle_prepare_inputs_padded_kernel`
   (MTP draft prep) — plus `vllm speculative.py:709` num_spec_tokens warning. Throughput 87 vs
   RUN0 99 tok/s (spec overhead at tiny scale).
-- Acceptance NUMBER: not surfaced — vLLM v1 logs no SpecDecoding/acceptance line to stdout in
-  this verl async-server path (grep empty even with disable_log_stats=False). For a hard number
-  we'd enable Prometheus or run a standalone `vllm serve` + `dflash.benchmark`. Doesn't block the
-  criterion (engagement proven by kernels). Open: whether the MTP head has real vs dummy weights
-  (load_format=dummy) — distinguishable only via the acceptance number.
+- Acceptance NUMBER (standalone, REAL weights, via `measure_spec_accept.py`, greedy):
+  **mean acceptance length 2.736 / 3.0, per-draft-token acceptance 86.8%**
+  (num_drafts 749, draft_tokens 1498, accepted 1300). → the MTP drafter itself is excellent.
+- KEY INSIGHT: standalone MTP is 86.8% but the IN-VERL run got *slower* (87 vs 99 tok/s). This
+  confirms the in-loop MTP head ran on **dummy weights** (verl uses `load_format=dummy` and reshards
+  only policy weights via Path B, never the MTP head). So Exp-1 plumbing is proven, but MTP only
+  *accelerates* the rollout if the draft weights are loaded/synced — i.e. the verl-native
+  `actor_rollout_ref.model.mtp.*` path (which reshards the MTP head), not engine_kwargs. This is
+  exactly the hook the co-training phase needs.
+  Note: vLLM v1's offline `LLM.get_metrics()` needs `disable_log_stats=False`; the verl async-server
+  path doesn't emit a spec-decode stat line to stdout, which is why the in-loop number isn't directly
+  readable (standalone measurement is the clean way).
 
 ## RUN 2 — DFlash (Path B, method=dflash, z-lab/Qwen3.5-4B-DFlash, n=15)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail
