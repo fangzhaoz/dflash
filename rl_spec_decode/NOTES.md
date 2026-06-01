@@ -6,8 +6,16 @@ See `FINDINGS.md` for the design + runbook. This file records what actually happ
 _Paste `resolved_versions.txt` (from `setup_env.sh`) here once installed._
 
 ```
-(pending setup_env.sh)
+(pending setup_env.sh — cu128 rebuild)
 ```
+
+### Env setup log
+- **Attempt 1 (cu13, FAILED gate):** plain-pip nightly pulled torch 2.11.0+**cu13**;
+  box driver 535.261.03 = CUDA 12.4 → `torch.cuda.is_available()=False` (CUDA-13 needs
+  driver ≥580). vLLM 0.22.1rc1.dev24, transformers 5.8.1, numpy 2.3.5 (numpy<2 conflict
+  is cosmetic). 8× H100 visible.
+- **Attempt 2 (cu128):** `FRESH=1 ... VLLM_CUDA=cu128`. Result: ⬜ pending paste-back of
+  `resolved_versions.txt` + ENV GATE (cuda_available + dflash_refs_in_build).
 
 ## RUN 0 — smoke (no spec)
 - Status: ⬜ not run / ⬜ pass / ⬜ fail

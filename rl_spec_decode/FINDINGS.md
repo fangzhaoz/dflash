@@ -43,6 +43,17 @@ verl's rollout is largely version-decoupled (composes a `vllm serve` CLI list �
 Script: `setup_env.sh` → writes/pastes back `resolved_versions.txt` (verl commit, vLLM,
 torch, transformers, tensordict, ray, CUDA, GPUs, + `pip check` conflicts).
 
+**CUDA build vs driver (resolved, learned from the first attempt).** Plain
+`pip install --pre vllm` is driver-unaware and pulled a **CUDA-13 torch** (torch 2.11+cu13),
+but the box driver is **535.261.03 (CUDA 12.4)** → `torch.cuda.is_available()==False` (CUDA 13
+is a new *major*; needs driver ≥580). Fix: install the **cu128 nightly variant**
+(`uv --torch-backend=cu128 --extra-index-url https://wheels.vllm.ai/nightly/cu128`) — still
+the nightly (so `dflash` is in the build), but CUDA-12, which runs on the 535 driver via CUDA
+*minor-version compatibility* (any 12.x build runs on driver ≥525.60.13). `setup_env.sh`
+then **hard-gates** before declaring the env good: asserts `torch.cuda.is_available()` AND
+greps the installed vLLM for `dflash` (version-number-independent — don't trust the tag).
+Re-run with `FRESH=1` once to clear the polluted cu13 env.
+
 ---
 
 ## 2. How spec-config reaches the engine (two passthrough paths) — **no verl patch needed**
