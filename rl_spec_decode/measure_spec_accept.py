@@ -129,6 +129,77 @@ class DFlashReproExtension:
             import traceback
             return {"status": f"FAILED {type(e).__name__}: {e}", "tb": traceback.format_exc()}
 
+    # --- buffer capture/restore (the sleep/wake fix) -----------------------------------------
+    # sleep(level=2) frees ALL engine memory; wake re-maps it ZEROED; load_weights only restores
+    # PARAMETERS. Config-derived buffers (rope cos_sin_cache, attn _k/_q/_v/_prob_scale) and
+    # DFlash plain-attr caches (_rope_cos_sin_cache) are computed at init (correct even under dummy)
+    # and NEVER repopulated by load_weights -> they stay zero -> draft is positionally blind -> ~0%.
+    # Fix: clone the good (nonzero) buffers BEFORE the first sleep, copy them back AFTER each wake.
+    # Needs no model internals; these tensors are constants across steps, so save/restore is exact.
+    def _state_tensors(self, root):
+        """(key, owner_module, attr_name, is_registered_buffer) for every registered buffer AND
+        plain tensor attribute in the tree. Plain attrs catch DFlash caches named_buffers() misses."""
+        import torch
+        out = []
+        for mod_name, mod in root.named_modules():
+            for bname, b in list(mod._buffers.items()):
+                if isinstance(b, torch.Tensor):
+                    out.append((mod_name + ".#buf#." + bname, mod, bname, True))
+            for aname, a in list(vars(mod).items()):
+                if isinstance(a, torch.Tensor) and aname not in mod._buffers:
+                    out.append((mod_name + ".#attr#." + aname, mod, aname, False))
+        return out
+
+    @staticmethod
+    def _is_zero(t):
+        try:
+            return float(t.detach().float().norm()) == 0.0
+        except Exception:
+            return False
+
+    def _get_t(self, owner, attr, is_buf):
+        return owner._buffers[attr] if is_buf else getattr(owner, attr, None)
+
+    def capture_buffers(self):
+        """Snapshot nonzero buffers/caches of BOTH main and draft, BEFORE any sleep."""
+        import torch
+        self._buf_cache = {}
+        counts = {}
+        for tag, mod in (("main", self.model_runner.model), ("draft", self._draft_model())):
+            if mod is None:
+                counts[tag] = None
+                continue
+            d = {}
+            for key, owner, attr, is_buf in self._state_tensors(mod):
+                t = self._get_t(owner, attr, is_buf)
+                if isinstance(t, torch.Tensor) and not self._is_zero(t):
+                    d[key] = t.detach().clone()
+            self._buf_cache[tag] = d
+            counts[tag] = len(d)
+        return counts
+
+    def restore_buffers(self):
+        """Copy captured buffers back into any tensor that wake left zeroed."""
+        import torch
+        if not getattr(self, "_buf_cache", None):
+            return {"status": "no cache (capture_buffers never ran)"}
+        counts = {}
+        for tag, mod in (("main", self.model_runner.model), ("draft", self._draft_model())):
+            if mod is None:
+                continue
+            saved = self._buf_cache.get(tag, {})
+            n = 0
+            for key, owner, attr, is_buf in self._state_tensors(mod):
+                s = saved.get(key)
+                if s is None:
+                    continue
+                t = self._get_t(owner, attr, is_buf)
+                if isinstance(t, torch.Tensor) and tuple(t.shape) == tuple(s.shape) and self._is_zero(t):
+                    t.data.copy_(s.to(t.device, t.dtype))
+                    n += 1
+            counts[tag] = n
+        return counts
+
     def snapshot_draft(self):
         """Object-level snapshot of the draft (WIRING + values). data_ptr only used WITHIN this
         process to compute sharing/tie booleans (ptrs are not comparable across processes)."""
@@ -247,8 +318,10 @@ def _run_path(args, load_format, do_inject, sleep_wake=False):
 
     if sleep_wake:
         # Replicate verl's per-step lifecycle: the ONLY variable B-vs-verl omits.
-        # init(dummy) -> sleep(level=2) DISCARDS engine weights -> wake re-allocs ->
-        # (then the inject block below restores policy + draft, exactly verl's order).
+        # init(dummy) -> [capture good buffers] -> sleep(level=2) DISCARDS engine weights ->
+        # wake re-allocs ZEROED -> (inject restores params) -> [restore buffers].
+        print("[capture] snapshot config-derived buffers BEFORE sleep ...", flush=True)
+        print("  capture_buffers ->", llm.collective_rpc("capture_buffers"), flush=True)
         print(f"[sleep_wake] llm.sleep(level=2) x{args.cycles} cycle(s) ...", flush=True)
         for i in range(args.cycles):
             llm.sleep(level=2)
@@ -262,6 +335,11 @@ def _run_path(args, load_format, do_inject, sleep_wake=False):
         print("[inject] running verl hook (inject_draft)...", flush=True)
         inject_status = llm.collective_rpc("inject_draft")
         print("  inject_draft ->", inject_status, flush=True)
+
+    if sleep_wake:
+        # THE FIX under test: copy the captured buffers back into the wake-zeroed tensors.
+        print("[restore] restoring wake-zeroed buffers (main+draft) ...", flush=True)
+        print("  restore_buffers ->", llm.collective_rpc("restore_buffers"), flush=True)
 
     totals = {"num_drafts": 0.0, "num_draft_tokens": 0.0, "num_accepted_tokens": 0.0}
     greedy, totals = _measure(llm, prompts, 0.0, args.max_tokens, totals)
