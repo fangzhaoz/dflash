@@ -61,15 +61,19 @@ driver 535.261.03.
 - Acceptance NUMBER (standalone, REAL weights, via `measure_spec_accept.py`, greedy):
   **mean acceptance length 2.736 / 3.0, per-draft-token acceptance 86.8%**
   (num_drafts 749, draft_tokens 1498, accepted 1300). → the MTP drafter itself is excellent.
-- HYPOTHESIS (NOT yet confirmed — being measured directly): standalone MTP is 86.8% but the IN-VERL
-  run got *slower* (87 vs 99 tok/s). This *suggests* the in-loop MTP head may run on **dummy weights**
-  (verl uses `load_format=dummy`; Path B reshards only policy weights, and whether that includes the
-  MTP head is unverified). The slowdown could equally be spec overhead at tiny scale (temp=1.0 sampling
-  vs standalone greedy, n=2 reusing the 1 MTP layer, eager). **Do NOT treat 86.8% as the in-rollout
-  number** — it's the drafter's standalone quality. The in-rollout number is being measured via the
-  read-only verl patch (see Patches below). If it's near 0% → Path B doesn't sync the draft and effective
-  in-RL MTP needs the verl-native `model.mtp.*` resync path (the co-training hook); if ~86% → the head
-  is real in-loop and the slowdown is pure overhead.
+- IN-ROLLOUT ACCEPTANCE (MEASURED via the read-only verl patch, see Patches): **0.000%**
+  (`num_drafts` ~88–96k, `num_draft_tokens` ~177–193k, `num_accepted_tokens` = 0; mean acceptance
+  length 1.000). CONFIRMED: in the verl rollout the **MTP head runs on dummy weights** — `load_format=dummy`
+  inits it random and Path B reshards only the policy weights, never the MTP head. The draft→verify
+  machinery genuinely runs (hundreds of k draft tokens proposed, spec kernels execute) but 0% are
+  accepted, which is why throughput *dropped* (pure overhead, no payoff).
+- CONTRAST: standalone real-weight MTP = **86.8%** (drafter quality) vs in-rollout dummy-weight MTP =
+  **0.0%**. So 86.8% is NOT the in-rollout number.
+- IMPLICATION: Exp-1 plumbing is proven, but effective in-RL MTP requires syncing the draft head —
+  the verl-native `actor_rollout_ref.model.mtp.*` path that reshards it. That is exactly the
+  drafter-resync / co-training mechanism (next phase); this 0% is its baseline (a synced head should
+  move it toward ~86%). Earlier "we used the MTP head during GRPO" was wrong in the *effective* sense;
+  now measured, not inferred.
   Note: vLLM v1's offline `LLM.get_metrics()` needs `disable_log_stats=False`; the verl async-server
   path doesn't emit a spec-decode stat line to stdout, which is why the in-loop number isn't directly
   readable (standalone measurement is the clean way).
