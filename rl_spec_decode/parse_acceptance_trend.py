@@ -30,6 +30,21 @@ ACCEPT = re.compile(
 )
 
 
+def _linfit(xs, ys):
+    """Least-squares slope + Pearson r (pure python). Returns (slope, intercept, r) or None."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx = sum(xs) / n; my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    if sxx == 0 or syy == 0:
+        return None
+    slope = sxy / sxx
+    return slope, my - slope * mx, sxy / ((sxx * syy) ** 0.5)
+
+
 def _spark(vals):
     if not vals:
         return ""
@@ -118,8 +133,32 @@ def main():
               f"min={min(accs):.4f}  max={max(accs):.4f}  delta(last-first)={accs[-1]-accs[0]:+.4f}")
         print(f"  acc  {_spark(accs)}")
         print(f"  len  {_spark(mls)}   (mean_len first={mls[0]:.3f} last={mls[-1]:.3f})")
-        print("note: step 0 is usually the initial validation rollout (greedy) — read the trend "
-              "from step 1 onward.")
+
+        # TREND on the sampled TRAINING steps only: drop the initial greedy-validation outlier
+        # (its drafts are >>3x the median because it's the whole test set), then linear-fit
+        # per_tok_acc vs step. This separates real drift from the greedy->sampled jump.
+        med = sorted(r[2] for r in rows)[len(rows) // 2]
+        train = [r for r in rows if r[2] <= 3 * med]
+        dropped = [r[0] for r in rows if r[2] > 3 * med]
+        if dropped:
+            print(f"\n(excluding step(s) {dropped} as the greedy validation rollout: drafts >> median)")
+        if len(train) >= 3:
+            xs = [r[0] for r in train]; ys = [r[5] for r in train]; mly = [r[6] for r in train]
+            fa = _linfit(xs, ys); fm = _linfit(xs, mly)
+            span = xs[-1] - xs[0]
+            if fa:
+                sl, _, r = fa
+                print(f"TREND per_tok_acc (steps {xs[0]}..{xs[-1]}): slope={sl:+.5f}/step  "
+                      f"total Δ over run={sl*span:+.4f}  Pearson_r={r:+.3f}  "
+                      f"mean={sum(ys)/len(ys):.4f}")
+            if fm:
+                sl, _, r = fm
+                print(f"TREND mean_len      (steps {xs[0]}..{xs[-1]}): slope={sl:+.5f}/step  "
+                      f"total Δ over run={sl*span:+.4f}  Pearson_r={r:+.3f}  "
+                      f"mean={sum(mly)/len(mly):.3f}")
+            print("verdict: |Pearson_r|<~0.3 and |total Δ| within step-to-step noise => essentially "
+                  "FLAT (no drift); a clearly negative slope with |r|>~0.5 => the frozen drafter is "
+                  "going stale as the policy drifts.")
 
     if args.csv:
         with open(args.csv, "w") as f:
