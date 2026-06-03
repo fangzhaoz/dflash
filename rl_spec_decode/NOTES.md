@@ -292,7 +292,27 @@ flat — Pearson r ≈ 0.) Likely why: KL-reg keeps hidden states in-distributio
 shifts global answer-correctness more than the LOCAL 1–2-token predictability the MTP head exploits; and
 we copy the LIVE policy embed into the draft each wake (only the 1 MTP layer is frozen). IMPLICATION: at
 this scale/task/horizon MTP co-training buys nothing — there is no decay to fix. Caveat: short horizon.
-### DFlash (n=15): PENDING — the more drift-sensitive test (15-token blocks off target hidden states).
+### DFlash (n=15): CLEAR DRIFT — acceptance decays as the policy moves (measured)
+Same 50-step GRPO (reward again ~0.05→~0.7). Unlike MTP, the frozen DFlash drafter DEGRADES:
+`per_tok_acc slope=-0.00150/step, total Δ=-0.0722, Pearson_r=-0.652, mean=0.2909`;
+`mean_len slope=-0.02255/step, total Δ=-1.0826, Pearson_r=-0.652, mean=5.364` — mean acceptance length
+falls ~5.8 (early) → ~5.0 (late), losing ~1 token (~16% relative) over 50 steps (sparkline ramps down;
+dips to ~4.4 @ step 35–36 then partially recovers — drift isn't perfectly monotonic). Checks that it's
+REAL: (1) as mean_len fell, the number of draft BLOCKS rose (more rounds/response, peak drafts at the
+step-36 low) → genuine acceptance decay, not a volume artifact; (2) mean_len is a RATE (immune to the
+response-length / Ray-dedup confounds) and temperature was constant, so the only change is the POLICY
+weights = drift.
+
+### WHY MTP flat but DFlash drifts → DRAFT HORIZON (the headline finding)
+MTP predicts 1–2 LOCAL tokens (robust to global policy change). DFlash drafts a 15-token BLOCK off the
+target's hidden states, so it must model the policy's LONGER-RANGE generation behavior, which shifts as
+the policy learns → block predictions degrade (deeper into the block = more dependent on the evolved
+policy). MEASURED contrast: MTP Pearson_r=-0.035 (flat) vs DFlash Pearson_r=-0.652 (clear decay) over the
+same run. IMPLICATION: co-training has CONCRETE, MEASURED value for DFlash (recover the ~1-token/50-step
+loss, which compounds over a real multi-hundred-step run); MTP doesn't need it at this scale/horizon. This
+is the motivation for the co-training phase — now grounded in a measured decay curve (r=-0.65) to beat.
+Artifacts: trend CSVs `/tmp/{mtp,dflash}_trend.csv`; reproduce via `run{1,2}*.sh STEPS=50` + both patches
++ `parse_acceptance_trend.py`.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
