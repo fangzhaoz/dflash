@@ -13,7 +13,9 @@
 # Run (leave your current ghost.py running — this script will cycle it):
 #   nohup bash rl_spec_decode/run_drift_2x200.sh &> /tmp/drift_2x200.out &
 #   tail -f /tmp/drift_2x200.out
-# Stop EVERYTHING (incl. the keep-alive):  pkill -f run_drift_2x200 ; pkill -f ghost.py
+# Stop the GPU keep-alive (after the runs):  touch /tmp/STOP_SPIN
+# Force-stop everything:  pkill -9 -f run_drift_2x200 ; pkill -9 -f ghost.py ;
+#   nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
 # =============================================================================
 set -eo pipefail
 
@@ -23,6 +25,30 @@ ENV_NAME=${ENV_NAME:-dflash-verl}
 STEPS=${STEPS:-200}
 GHOST=${GHOST:-/opt/tiger/lmc_muon/ghost.py}   # GPU keep-alive script
 GHOST_SIZE=${GHOST_SIZE:-65000}
+STOP_FILE=${STOP_FILE:-/tmp/STOP_SPIN}         # touch this to stop the keep-alive gracefully
+
+# Free the GPUs: kill ghost.py AND its spawn-worker children (which DON'T have 'ghost.py' in
+# argv, so pkill -f ghost.py misses them), then wait until memory is actually released. NOTE:
+# this kills ALL GPU compute processes — intended for this dedicated box where the only GPU user
+# at driver-start is the keep-alive (or a leftover run). Guarded to run only before our verl runs.
+free_gpus() {
+  pkill -9 -f ghost.py 2>/dev/null || true
+  sleep 3
+  local pids
+  pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -E '^[0-9]+$' || true)
+  if [ -n "$pids" ]; then
+    echo ">> killing leftover GPU processes (spawn workers / zombies): $(echo $pids | tr '\n' ' ')"
+    echo "$pids" | xargs -r kill -9 2>/dev/null || true
+  fi
+  local i maxused
+  for i in $(seq 1 12); do
+    maxused=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)
+    [ -z "$maxused" ] && break
+    if [ "$maxused" -lt 2000 ]; then echo ">> GPUs free (max used ${maxused} MiB)"; return 0; fi
+    echo ">> waiting for GPUs to free (max used ${maxused} MiB) ..."; sleep 5
+  done
+  echo "!! GPUs still not free after wait (max used ${maxused} MiB) — the verl run may OOM."
+}
 P_MEAS="$DFLASH_DIR/rl_spec_decode/patches/spec_accept_measurement.patch"
 P_INJ="$DFLASH_DIR/rl_spec_decode/patches/draft_inject_static.patch"
 LOGDIR="$DFLASH_DIR/rl_spec_decode/logs"; mkdir -p "$LOGDIR"
@@ -40,8 +66,10 @@ if ! git diff --quiet; then
 fi
 
 start_ghost() {
-  echo ">> relaunching GPU keep-alive: python $GHOST --size $GHOST_SIZE   (stop: pkill -f ghost.py)"
-  exec python "$GHOST" --size "$GHOST_SIZE"
+  rm -f "$STOP_FILE"   # else a leftover stop-file makes the new keep-alive exit immediately
+  echo ">> relaunching GPU keep-alive: python $GHOST --size $GHOST_SIZE --stop-file $STOP_FILE"
+  echo "   (stop gracefully:  touch $STOP_FILE   |  or force:  pkill -9 -f ghost.py)"
+  exec python "$GHOST" --size "$GHOST_SIZE" --stop-file "$STOP_FILE"
 }
 on_exit() {
   set +e
@@ -54,11 +82,10 @@ on_exit() {
 }
 trap on_exit EXIT   # from here on, ANY exit reverts patches + restarts the keep-alive
 
-# free the GPUs for the verl runs
-echo ">> stopping any running ghost.py keep-alive to free the GPUs ..."
-pkill -f ghost.py 2>/dev/null || true
-sleep 10
-nvidia-smi --query-gpu=memory.used --format=csv,noheader || true
+# free the GPUs for the verl runs (kills ghost.py + its spawn workers; waits until released)
+echo ">> freeing GPUs for the verl runs ..."
+free_gpus
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader || true
 
 git apply --check "$P_MEAS" && git apply --check "$P_INJ" || { echo "APPLY-CHECK FAILED — aborting"; exit 1; }
 git apply "$P_MEAS"; git apply "$P_INJ"
