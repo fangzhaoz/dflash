@@ -28,6 +28,23 @@ ACCEPT = re.compile(
     r"num_drafts': (?P<d>[\d.]+).*?num_draft_tokens': (?P<t>[\d.]+).*?"
     r"num_accepted_tokens': (?P<a>[\d.]+)"
 )
+# GRPO reward per training step (one long metric line per step).
+REWARD = re.compile(
+    r"training/global_step:(?P<step>\d+).*?critic/score/mean:(?:np\.float64\()?(?P<r>[-\d.eE+]+)"
+)
+
+
+def from_reward(lines):
+    """global_step -> mean GRPO reward (critic/score/mean)."""
+    out = {}
+    for ln in lines:
+        m = REWARD.search(ln)
+        if m:
+            try:
+                out[int(m["step"])] = float(m["r"])
+            except ValueError:
+                pass
+    return out
 
 
 def _linfit(xs, ys):
@@ -100,6 +117,14 @@ def main():
     args = ap.parse_args()
 
     lines = open(args.log, errors="ignore").read().splitlines()
+    reward = from_reward(lines)  # global_step -> GRPO reward (critic/score/mean)
+
+    def rwd(s):
+        for k in (s, s + 1, s - 1):  # align acceptance step to global_step (tolerate ±1 offset)
+            if k in reward:
+                return reward[k]
+        return None
+
     steps = from_trend(lines)
     source = "SPEC-TREND (per-step deltas)"
     if not steps:
@@ -119,12 +144,14 @@ def main():
         ml = (e["a"] / e["d"] + 1.0) if e["d"] > 0 else 0.0
         rows.append((s, len(e["reps"]), e["d"], e["t"], e["a"], acc, ml))
 
-    print(f"\n=== in-rollout spec-decode acceptance TREND  ({source}) ===")
-    print(f"source log: {args.log}   steps: {len(rows)}")
-    print(f"{'step':>4}  {'reps':>4}  {'drafts':>9}  {'draft_tok':>10}  {'accepted':>9}  "
-          f"{'per_tok_acc':>11}  {'mean_len':>8}")
+    print(f"\n=== in-rollout REWARD + spec-decode acceptance TREND  ({source}) ===")
+    print(f"source log: {args.log}   steps: {len(rows)}   reward points: {len(reward)}")
+    print(f"{'step':>4}  {'reward':>7}  {'per_tok_acc':>11}  {'mean_len':>8}  {'reps':>4}  "
+          f"{'drafts':>9}  {'accepted':>9}")
     for (s, nr, d, t, a, acc, ml) in rows:
-        print(f"{s:>4}  {nr:>4}  {d:>9}  {t:>10}  {a:>9}  {acc:>11.4f}  {ml:>8.3f}")
+        rv = rwd(s)
+        rs = f"{rv:.4f}" if rv is not None else "   -   "
+        print(f"{s:>4}  {rs:>7}  {acc:>11.4f}  {ml:>8.3f}  {nr:>4}  {d:>9}  {a:>9}")
 
     accs = [r[5] for r in rows]
     mls = [r[6] for r in rows]
@@ -160,11 +187,27 @@ def main():
                   "FLAT (no drift); a clearly negative slope with |r|>~0.5 => the frozen drafter is "
                   "going stale as the policy drifts.")
 
+    # REWARD trend (independent of acceptance alignment — keyed by global_step directly).
+    if reward:
+        rs_xs = sorted(reward); rs_ys = [reward[s] for s in rs_xs]
+        print(f"\nGRPO reward: first={rs_ys[0]:.4f}  last={rs_ys[-1]:.4f}  "
+              f"min={min(rs_ys):.4f}  max={max(rs_ys):.4f}  delta={rs_ys[-1]-rs_ys[0]:+.4f}")
+        print(f"  rwd  {_spark(rs_ys)}")
+        fr = _linfit(rs_xs, rs_ys)
+        if fr:
+            sl, _, r = fr
+            print(f"TREND reward        (steps {rs_xs[0]}..{rs_xs[-1]}): slope={sl:+.5f}/step  "
+                  f"total Δ over run={sl*(rs_xs[-1]-rs_xs[0]):+.4f}  Pearson_r={r:+.3f}")
+        print("=> reads as: does the policy MOVE (reward rises) and, if so, does the FROZEN drafter's "
+              "acceptance fall with it (drift) or hold (robust)?")
+
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("step,replicas,drafts,draft_tokens,accepted,per_draft_token_acceptance,mean_acceptance_length\n")
+            f.write("step,reward,per_draft_token_acceptance,mean_acceptance_length,"
+                    "replicas,drafts,draft_tokens,accepted\n")
             for (s, nr, d, t, a, acc, ml) in rows:
-                f.write(f"{s},{nr},{d},{t},{a},{acc:.6f},{ml:.6f}\n")
+                rv = rwd(s)
+                f.write(f"{s},{'' if rv is None else f'{rv:.6f}'},{acc:.6f},{ml:.6f},{nr},{d},{t},{a}\n")
         print(f"\n[csv] wrote {args.csv}")
 
 
