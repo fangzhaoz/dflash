@@ -272,6 +272,28 @@ one fix (`draft_inject_static.patch`: `_inject_independent_draft_weights` + `_re
 gated `{dflash,mtp}`), proven standalone (modes A/E) then in real verl. Drafter runs on real, re-synced
 weights every wake on all 8 colocated replicas. STATIC source for now → co-training is the next phase.
 
+## DRIFT EXPERIMENT: does a FIXED drafter's acceptance decay as the GRPO policy moves?
+Setup: 50-step GRPO (gsm8k, lr 1e-6, kl_coef 0.001) with the STATIC injected drafter + per-step
+`SPEC-TREND` delta logging (`spec_accept_measurement.patch`), parsed by `parse_acceptance_trend.py`
+(linear-fit slope + Pearson r over the sampled training steps; the step-1 greedy-validation rollout is
+auto-excluded as it's the whole test set drafted greedily). Tooling note: Prometheus counters are
+CUMULATIVE, so the lifetime-average `SPEC-ACCEPT` line masks the trend — must use the `SPEC-TREND`
+per-step deltas. Also note rollout is SAMPLED (compare to the temp-1.0 refs MTP 0.802/2.60,
+DFlash 0.292/5.37, NOT the greedy refs).
+
+### MTP (n=2): NO DRIFT — flat over 50 steps (measured)
+The policy moved a LOT: GSM8K reward `critic/score/mean 0.05 → 0.72`, KL 0 → 0.18, entropy 0.26→0.24,
+grad_norm ~3.6. Yet the frozen MTP drafter's per-step acceptance is statistically FLAT:
+`per_tok_acc slope=-0.00005/step, total Δ over run=-0.0025, Pearson_r=-0.035, mean=0.8169`;
+`mean_len slope=-0.00011/step, Δ=-0.0051, r=-0.035, mean=2.634` — i.e. it sits on the temp-1.0 reference
+the whole way, no decay. (Watch out: raw `accepted` COUNT and a step-1-vs-step-50 `mean_len` comparison
+look like a drop but are a volume difference and a greedy-vs-sampled confound respectively; the RATE is
+flat — Pearson r ≈ 0.) Likely why: KL-reg keeps hidden states in-distribution for the MTP head; GSM8K RL
+shifts global answer-correctness more than the LOCAL 1–2-token predictability the MTP head exploits; and
+we copy the LIVE policy embed into the draft each wake (only the 1 MTP layer is frozen). IMPLICATION: at
+this scale/task/horizon MTP co-training buys nothing — there is no decay to fix. Caveat: short horizon.
+### DFlash (n=15): PENDING — the more drift-sensitive test (15-token blocks off target hidden states).
+
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
 real weights are loaded:
