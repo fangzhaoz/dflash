@@ -7,12 +7,21 @@ on the next run with no reinstall.
 ## spec_accept_measurement.patch  (MEASUREMENT ONLY — not part of the baselines)
 
 Adds a **read-only** hook to `vLLMHttpServer` (`verl/workers/rollout/vllm_rollout/vllm_async_server.py`):
-a `_log_spec_decode_metrics()` method that reads the vLLM Prometheus registry and logs the
-cumulative spec-decode acceptance, called at the top of `sleep()` (runs once per rollout step,
-after generation). It does NOT alter generation, sampling, the spec config, or weight sync — it
-only reads counters and logs. Requires `rollout.disable_log_stats=False` (all run scripts set this).
+a `_log_spec_decode_metrics()` method that reads the vLLM Prometheus registry, called at the top of
+`sleep()` (once per rollout step, after generation). It does NOT alter generation, sampling, the spec
+config, or weight sync. Requires `rollout.disable_log_stats=False` (all run scripts set this). It logs
+two lines per step per replica:
+- `>>> SPEC-ACCEPT …` — the **cumulative** (lifetime-average) acceptance from the raw counters.
+- `>>> SPEC-TREND … step=N step_acc=… step_drafts/draft_tokens/accepted=… ` — the **per-step DELTA**
+  (the cumulative counters minus the previous step). Prometheus counters are cumulative, so the
+  lifetime average is sluggish and **masks how acceptance changes as the policy drifts during GRPO**;
+  the delta is the per-step rate you actually want to monitor. `step`+`replica`+values make each line
+  unique so Ray's log-dedup can't drop it.
 
-Purpose: get the **in-rollout** MTP/DFlash acceptance number directly, instead of inferring it.
+Purpose: get the **in-rollout** MTP/DFlash acceptance number directly (and its trend over training).
+Parse a run log into a clean `step → acceptance` curve with
+`rl_spec_decode/parse_acceptance_trend.py <log>` (aggregates the per-step deltas across replicas,
+prints a table + sparkline, `--csv` to export).
 
 ## draft_inject_static.patch  (FIRST verl BEHAVIOR change — write-hook, MEASUREMENT/EXPERIMENT)
 

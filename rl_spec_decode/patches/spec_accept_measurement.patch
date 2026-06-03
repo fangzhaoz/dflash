@@ -1,6 +1,6 @@
 --- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
 +++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-@@ -625,8 +625,67 @@
+@@ -625,8 +625,84 @@
              await self.engine.reset_prefix_cache()
          elif self.rollout_mode == RolloutMode.STANDALONE:
              logger.info("skip wake_up in standalone mode")
@@ -8,16 +8,16 @@
 +    async def _log_spec_decode_metrics(self):
 +        """READ-ONLY measurement hook (verl patch, NOT part of the baseline runs).
 +
-+        Logs per-step in-rollout spec-decode acceptance. vLLM resets these counters on each
-+        wake_up (free_cache_engine), so each line reflects THAT step's generation. Uses print()
-+        (not logger.info) because this Ray-actor process has no INFO logging handler, so INFO
-+        records are dropped. Does NOT alter generation, sampling, spec config, or weight sync.
-+        ALWAYS prints a heartbeat. Requires rollout.disable_log_stats=False.
++        Logs in-rollout spec-decode acceptance each step. The Prometheus counters are CUMULATIVE,
++        so the SPEC-ACCEPT line is a lifetime average; the SPEC-TREND line logs the per-step DELTA
++        (which reveals how acceptance changes as the policy drifts during GRPO — a lifetime average
++        would mask that). Uses print() (this Ray-actor process has no INFO handler). Does NOT alter
++        generation, sampling, spec config, or weight sync. Requires rollout.disable_log_stats=False.
 +        """
 +        try:
 +            def _sum(obj, attr):
 +                return int(sum(getattr(obj, attr, []) or []))
- 
++
 +            info = {"replica": self.replica_rank}
 +            reg = {}
 +            try:
@@ -60,11 +60,28 @@
 +            if drafts and accepted is not None and drafts > 0:
 +                msg += f" | mean_acceptance_length={accepted / drafts + 1.0:.3f}"
 +            print(msg, flush=True)
++
++            # Per-step DELTA trend. Counters are cumulative, so subtract the previous step (handle a
++            # counter reset on wake: current < prev -> use current). step+replica+values make each
++            # line unique so Ray won't dedup it. Parse with rl_spec_decode/parse_acceptance_trend.py.
++            prev = getattr(self, "_spec_prev", None) or {"d": 0.0, "t": 0.0, "a": 0.0}
++            step = getattr(self, "_spec_step", 0)
++            cd, ct, ca = float(drafts or 0.0), float(draft_tokens or 0.0), float(accepted or 0.0)
++            dd = cd - prev["d"] if cd >= prev["d"] else cd
++            dt = ct - prev["t"] if ct >= prev["t"] else ct
++            da = ca - prev["a"] if ca >= prev["a"] else ca
++            self._spec_prev = {"d": cd, "t": ct, "a": ca}
++            self._spec_step = step + 1
++            if dt > 0:
++                print(f">>> SPEC-TREND replica={self.replica_rank} step={step} "
++                      f"step_acc={da / dt:.4f} step_mean_len={(da / dd + 1.0) if dd > 0 else 0.0:.3f} "
++                      f"step_drafts={int(dd)} step_draft_tokens={int(dt)} step_accepted={int(da)} "
++                      f"cum_acc={(ca / ct) if ct > 0 else 0.0:.4f}", flush=True)
 +        except Exception as e:
 +            print(f">>> SPEC-ACCEPT hook failed: {e}", flush=True)
-+
+
      async def sleep(self):
 +        await self._log_spec_decode_metrics()  # READ-ONLY measurement (verl patch; rl_spec_decode)
          if self.node_rank != 0 or not self.config.free_cache_engine:
              return
- 
+
