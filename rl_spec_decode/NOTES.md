@@ -281,7 +281,7 @@ CUMULATIVE, so the lifetime-average `SPEC-ACCEPT` line masks the trend — must 
 per-step deltas. Also note rollout is SAMPLED (compare to the temp-1.0 refs MTP 0.802/2.60,
 DFlash 0.292/5.37, NOT the greedy refs).
 
-### MTP (n=2): NO DRIFT — flat over 50 steps (measured)
+### MTP (n=2): flat over 50 steps — BUT this was HORIZON-LIMITED (revised by the 200-step run below)
 The policy moved a LOT: GSM8K reward `critic/score/mean 0.05 → 0.72`, KL 0 → 0.18, entropy 0.26→0.24,
 grad_norm ~3.6. Yet the frozen MTP drafter's per-step acceptance is statistically FLAT:
 `per_tok_acc slope=-0.00005/step, total Δ over run=-0.0025, Pearson_r=-0.035, mean=0.8169`;
@@ -290,8 +290,9 @@ the whole way, no decay. (Watch out: raw `accepted` COUNT and a step-1-vs-step-5
 look like a drop but are a volume difference and a greedy-vs-sampled confound respectively; the RATE is
 flat — Pearson r ≈ 0.) Likely why: KL-reg keeps hidden states in-distribution for the MTP head; GSM8K RL
 shifts global answer-correctness more than the LOCAL 1–2-token predictability the MTP head exploits; and
-we copy the LIVE policy embed into the draft each wake (only the 1 MTP layer is frozen). IMPLICATION: at
-this scale/task/horizon MTP co-training buys nothing — there is no decay to fix. Caveat: short horizon.
+we copy the LIVE policy embed into the draft each wake (only the 1 MTP layer is frozen). IMPLICATION (REVISED — see the 200-step run): at 50 steps MTP co-training looks unnecessary, BUT that
+was just too-short a horizon (the policy hadn't moved enough); over 200 steps MTP DOES drift. Do not
+read this 50-step flatness as "MTP never goes stale."
 ### DFlash (n=15): CLEAR DRIFT — acceptance decays as the policy moves (measured)
 Same 50-step GRPO (reward again ~0.05→~0.7). Unlike MTP, the frozen DFlash drafter DEGRADES:
 `per_tok_acc slope=-0.00150/step, total Δ=-0.0722, Pearson_r=-0.652, mean=0.2909`;
@@ -313,6 +314,29 @@ loss, which compounds over a real multi-hundred-step run); MTP doesn't need it a
 is the motivation for the co-training phase — now grounded in a measured decay curve (r=-0.65) to beat.
 Artifacts: trend CSVs `/tmp/{mtp,dflash}_trend.csv`; reproduce via `run{1,2}*.sh STEPS=50` + both patches
 + `parse_acceptance_trend.py`.
+
+## ✅ 200-STEP RUN (consistent SAMPLED decoding, NO greedy val) — BOTH drafters drift; DFlash more
+Cleaned-up design (`run_drift_2x200.sh`): SAMPLED every step, `trainer.val_before_train=False` (no greedy
+step-0 confound), reward + acceptance recorded together (`parse_acceptance_trend.py` now extracts
+`critic/score/mean`). Both curves START right at the temp-1.0 reference (MTP step-1 0.82 ≈ ref 0.80;
+DFlash 0.32 ≈ 0.29), so the declines are pure drift. Reward climbed hugely in both (MTP 0.00→0.94,
+DFlash 0.02→0.84) — a large policy shift, with entropy collapsing (~0.09) and grad_norm 24–78 late.
+| drafter | reward | per_tok first→last (rel) | mean_len first→last (rel) | Pearson r |
+|---|---|---|---|---|
+| MTP (n=2)     | 0.00→0.94 | 0.82→0.58 (−30%) | 2.64→2.15 (−19%) | **−0.40** |
+| DFlash (n=15) | 0.02→0.84 | 0.32→0.22 (−31%) | 5.83→4.31 (−26%) | **−0.57** |
+KEY CORRECTION vs the 50-step run: **MTP DOES drift at 200 steps** (r=−0.40), it just didn't at 50 (r=−0.035)
+— the 50-step "MTP flat / co-training buys nothing" was a horizon artifact. Refined finding:
+- frozen drafters go stale under RL for BOTH methods given enough policy movement;
+- per-draft-token quality degrades ~30% (relative) for BOTH — neither head is intrinsically immune;
+- DFlash is MORE drift-sensitive: drifts EARLIER (visible at 50 steps when MTP was flat), CLEANER trend
+  (r −0.57 vs −0.40), and bigger throughput loss in absolute tokens (mean_len −1.5 vs −0.49, since
+  mean_len = n·per_tok+1 amplifies its smaller per-token drop across the 15-token block);
+- acceptance keeps FALLING even after reward PLATEAUS (~step 80–100) because the policy keeps moving
+  (entropy collapse / over-optimization) — so drift tracks policy movement, not reward;
+- observed throughput cost: late DFlash gen ~17–22 s/step vs ~8 s early (degraded draft → more target passes).
+IMPLICATION: co-training is motivated for BOTH drafters over a realistic horizon, DFlash more urgently.
+Artifacts: `rl_spec_decode/logs/{mtp,dflash}_trend_200.csv`; reproduce via `bash rl_spec_decode/run_drift_2x200.sh`.
 
 ## STANDALONE REFERENCE ACCEPTANCE (real weights, greedy, measure_spec_accept.py)
 The drafters themselves are strong — these are the targets the in-RL numbers should approach once
